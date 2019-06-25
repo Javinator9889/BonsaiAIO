@@ -10,9 +10,6 @@ Statistics::Statistics(unsigned int maximumSize) {
     *_measures = new measure[maximumSize]{
         {0.0, "", false}
     };
-    /* _measures[maximumSize] = {
-        {0.0, "", false}
-    };*/
     _maximumSize = maximumSize;
     _max   = new measure{0.0, "", true};
     _min   = new measure{0.0, "", true};
@@ -73,6 +70,10 @@ float Statistics::calculateMean() {
         }
     }
     return (elements == 0) ? INT_MIN : (sum / elements);
+}
+
+measure Statistics::getLatestValueStored() {
+    return *_measures[_n];
 }
 
 Statistics::~Statistics() {

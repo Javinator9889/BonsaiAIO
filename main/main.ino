@@ -13,11 +13,13 @@
 // Components specific libraries
 #include <LiquidCrystal.h>
 #include <DHT.h>
+// Custom display modes
+#include "DisplayModes.h"
 
 // Other libraries
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#include <time.h>
+#include <Thread.h>
 
 // ESP8266 pinout
 #include "PinConstants.h"
@@ -25,13 +27,16 @@
 // Statistics library
 #include "Statistics.h"
 
+// Ticker timing
+#include <Ticker.h>
+
 // Define whether the DEVMODE is active
 // for saving sketch size - set to 0 for
 // disabling
 #define DEVMODE     1
 
 // Maximum stats we will keep in memory
-#define MAX_STATS   512
+#define MAX_STATS   256
 
 // Other "define" constants
 #define UTC_OFFSET  3600 // UTC+1
@@ -47,8 +52,9 @@ Statistics humdStats(MAX_STATS);
 Statistics waterLevelStats(MAX_STATS);
 
 // Time components
-WiFiUdp ntpUDP;
-NTPClient ntp(ntpUDP, "pool.ntp.org", UTC_OFFSET);
+WiFiUDP ntpUDP;
+NTPClient ntp(ntpUDP, "europe.pool.ntp.org", UTC_OFFSET);
+Thread clockThread = Thread();
 
 // Components pins
 const struct {
@@ -83,7 +89,38 @@ volatile uint32_t setupFinishedTime;
 volatile uint32_t cpuEvents;
 volatile uint32_t cpuTicksPerSecond;
 volatile uint32_t waterLevelWaitingTime;
-volatile uint32_t aSecond;
+volatile uint8_t  displayMode;
+#if DEVMODE
+  volatile uint32_t aSecond = 0;
+  bool printed = false;
+#endif
+
+// Constant structs that contains
+// application data
+volatile struct {
+  uint32_t waterLevelSensor;
+  uint32_t tempHumdSensor;
+  uint32_t clockSeconds;
+} waitingTimes = {7200, 180, 1};
+
+struct {
+  Ticker dhtSensor;
+  Ticker waterSensor;
+  Ticker clockControl;
+} sensors;
+
+struct {
+  float latestTemperature;
+  float latestHumidity;
+} dhtValues = {0.0, 0.0};
+
+struct {
+  uint16_t waterValue;
+} waterLevelValues = {0};
+
+// Other useful variables
+String formattedTime = "00:00 00";
+bool mustShowSeparator;
 
 // Define the functions that will be 
 // available
@@ -92,6 +129,10 @@ void rootPage();
 void initCpuTicksPerSecond();
 String generateRandomString();
 void changeDisplayMode();
+void launchClockThread();
+void updateTime();
+void updateDHTInfo();
+void updateWaterLevelInfo();
 
 
 void setup() {
@@ -102,25 +143,50 @@ void setup() {
   // Initialize the seed with a no connected pin
   randomSeed(analogRead(0));
 
+  Serial.println("Starting web server and cautive portal");
   // Start the web server and cautive portal
   Server.on("/", rootPage);
   if (Portal.begin()) {
-    Serial.println("HTTP server:" + WiFi.localIP().toString());
+    #if DEVMODE
+      Serial.println("Successfully connected to Internet!");
+      Serial.println("HTTP server:" + WiFi.localIP().toString());
+    #endif
+  } else {
+    #if DEVMODE
+      Serial.println("Error connecting to Internet");
+    #endif
   }
 
   // Init the UTP client - if we are here there is Internet connection
   ntp.begin();
   
   // Global variables definition
-  cpuTicksPerSecond = 0;
-  cpuEvents = 0;
+  cpuTicksPerSecond     = 0;
+  cpuEvents             = 0;
   waterLevelWaitingTime = 0;
-  aSecond = 0;
+  displayMode           = DEFAULT_MODE;
+  mustShowSeparator     = true;
   
   #if DEVMODE
     Serial.print("Setup elapsed time: ");
     Serial.println(millis());
   #endif
+
+  // Register button interruption
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), changeDisplayMode, CHANGE);
+  
+  // Setup timers
+  clockThread.onRun(updateTime);
+  clockThread.setInterval(1000);
+
+  sensors.dhtSensor.attach(waitingTimes.tempHumdSensor, updateDHTInfo);
+  sensors.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
+  sensors.clockControl.attach(waitingTimes.clockSeconds, launchClockThread);
+  
+  updateDHTInfo();
+  updateWaterLevelInfo();
+  updateTime();
+  
   setupFinishedTime = millis();
 }
 
@@ -128,32 +194,35 @@ void setup() {
 void loop() {
   // Do not start the code until we know
   // how many ticks happens each second
-  if (cpuTicksPerSecond == 0) {
+  /*if (cpuTicksPerSecond == 0) {
     initCpuTicksPerSecond();
     return;
   }
-  if (!printed) {
-    Serial.print("Ticks per second: ");
-    Serial.println(cpuTicksPerSecond);
-    printed = true;
-  }
-  if (aSecond == cpuTicksPerSecond) {
-    Serial.println("A second has passed");
-    aSecond = 0;
-  } else {
-    ++aSecond;
-  }
-  if (waterLevelWaitingTime == (cpuTicksPerSecond * 2)) {
+  #if DEVMODE
+    if (!printed) {
+      Serial.print("Ticks per second: ");
+      Serial.println(cpuTicksPerSecond);
+      printed = true;
+    }
+    if (aSecond == cpuTicksPerSecond) {
+      Serial.println("A second has passed");
+      aSecond = 0;
+    } else {
+      ++aSecond;
+    }
+  #endif
+  if (waterLevelWaitingTime == waitingTimes.waterLevelSensor) {
     int waterValue = analogRead(WATER_LEVEL_DATA_PIN);
-    Serial.print("Valor del agua: ");
-    Serial.println(waterValue);
+    #if DEVMODE
+      Serial.print("Valor del agua: ");
+      Serial.println(waterValue);
+    #endif
     waterLevelWaitingTime = 0;
   } else {
     ++waterLevelWaitingTime;
-  }
+  }*/
   Portal.handleClient();
 }
-
 
 
 void initAutoConnect(String password) {
@@ -166,11 +235,17 @@ void rootPage() {
   Server.send(200, "text/plain", content);
 }
 
+/**
+ * Unised since "Ticker" installation
+ */
 void initCpuTicksPerSecond() {
   uint32_t timeDifference = (uint32_t) (millis() - setupFinishedTime);
   ++cpuEvents;
   if (timeDifference >= 999) {
     cpuTicksPerSecond = cpuEvents;
+    waitingTimes.waterLevelSensor *= cpuTicksPerSecond;
+    waitingTimes.tempHumdSensor *= cpuTicksPerSecond;
+    waitingTimes.clockSeconds *= cpuTicksPerSecond;
   }
 }
 
@@ -185,4 +260,31 @@ String generateRandomString() {
   return randomString;
 }
 
-void changeDisplayMode() {}
+void changeDisplayMode() {
+  // TODO
+}
+
+void launchClockThread() {
+  clockThread.run();
+}
+
+void updateTime() {
+  if (WiFi.status() == WL_CONNECTED) {
+    ntp.update();
+    formattedTime = ntp.getHours();
+    formattedTime += (mustShowSeparator) ? ":" : " ";
+    formattedTime += ntp.getMinutes() + " " + ntp.getSeconds();
+    mustShowSeparator = !mustShowSeparator;
+  } else {
+    formattedTime = "No Internet!";
+  }
+}
+
+void updateDHTInfo() {
+  dhtValues.latestTemperature = dht.readTemperature();
+  dhtValues.latestHumidity = dht.readHumidity();
+}
+
+void updateWaterLevelInfo() {
+  waterLevelValues.waterValue = analogRead(WATER_LEVEL_DATA_PIN);
+}

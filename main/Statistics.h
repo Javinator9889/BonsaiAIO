@@ -29,6 +29,7 @@ public:
     float calculateMean();
     measure getMaximum();
     measure getMinimum();
+    measure getLatestValueStored();
     ~Statistics();
 };
 
