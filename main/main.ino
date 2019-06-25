@@ -6,9 +6,9 @@
  */
 
 // Web control & WiFi libraries
-//#include <ESP8266WiFi.h>
-//#include <ESP8266WebServer.h>
-//#include <AutoConnect.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <AutoConnect.h>
 
 // Components specific libraries
 #include <LiquidCrystal.h>
@@ -17,15 +17,24 @@
 // ESP8266 pinout
 #include "PinConstants.h"
 
+// Statistics library
+#include "Statistics.h"
+
 // Define whether the DEVMODE is active
-// for saving sketch size - comment for
+// for saving sketch size - set to 0 for
 // disabling
 #define DEVMODE   1
 
+// Maximum stats we will keep in memory
+#define MAX_STATS 512
+
 // Web control objects
-//ESP8266WebServer  Server;
-//AutoConnect       Portal(Server);
-//AutoConnectConfig config;
+ESP8266WebServer  Server;
+AutoConnect       Portal(Server);
+AutoConnectConfig config;
+
+// Statistics object
+Statistics stats(MAX_STATS);
 
 // Components pins
 const struct {
@@ -36,24 +45,24 @@ const struct {
   uint8_t d5;
   uint8_t d6;
   uint8_t d7;
-} lcdPins = {D7, D6, D5, D4, D3, D2};
+} LCD_PINS = {D7, D6, D5, D4, D3, D2};
 
 const struct {
   uint8_t data;
   uint8_t type;
-} dhtPin = {D1, DHT11};
+} DHT_PIN = {D1, DHT11};
 
-const uint8_t buttonPin = D9;
-const uint8_t waterLevelDataPin = A0;
+const uint8_t BUTTON_PIN = D9;
+const uint8_t WATER_LEVEL_DATA_PIN = A0;
 
 // Init components
-LiquidCrystal lcd(lcdPins.rs, 
-                  lcdPins.e, 
-                  lcdPins.d4, 
-                  lcdPins.d5, 
-                  lcdPins.d6, 
-                  lcdPins.d7);
-DHT dht(dhtPin.data, dhtPin.type);
+LiquidCrystal lcd(LCD_PINS.rs, 
+                  LCD_PINS.e, 
+                  LCD_PINS.d4, 
+                  LCD_PINS.d5, 
+                  LCD_PINS.d6, 
+                  LCD_PINS.d7);
+DHT dht(DHT_PIN.data, DHT_PIN.type);
                   
 // Global variables needed in hole project
 unsigned long setupFinishedTime;
@@ -105,7 +114,7 @@ void loop() {
     Serial.println(cpuTicksPerSecond);
   }
   if (waterLevelWaitingTime == (cpuTicksPerSecond * 2)) {
-    int waterValue = analogRead(waterLevelDataPin);
+    int waterValue = analogRead(WATER_LEVEL_DATA_PIN);
     Serial.println(waterValue);
     waterLevelWaitingTime = 0;
   } else
