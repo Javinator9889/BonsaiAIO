@@ -6,13 +6,16 @@
  */
 
 // Web control & WiFi libraries
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <AutoConnect.h>
+//#include <ESP8266WiFi.h>
+//#include <ESP8266WebServer.h>
+//#include <AutoConnect.h>
 
 // Components specific libraries
 #include <LiquidCrystal.h>
 #include <DHT.h>
+
+// ESP8266 pinout
+#include "PinConstants.h"
 
 // Define whether the DEVMODE is active
 // for saving sketch size - comment for
@@ -20,27 +23,28 @@
 #define DEVMODE   1
 
 // Web control objects
-ESP8266WebServer  Server;
-AutoConnect       Portal(Server);
-AutoConnectConfig config;
+//ESP8266WebServer  Server;
+//AutoConnect       Portal(Server);
+//AutoConnectConfig config;
 
 // Components pins
 const struct {
-  int rs;
-  int e;
+  uint8_t rs;
+  uint8_t e;
   
-  int d4;
-  int d5;
-  int d6;
-  int d7;
-} lcdPins = {12, 11, 5, 4, 3, 2};
+  uint8_t d4;
+  uint8_t d5;
+  uint8_t d6;
+  uint8_t d7;
+} lcdPins = {D7, D6, D5, D4, D3, D2};
 
 const struct {
-  int data;
+  uint8_t data;
   uint8_t type;
-} dhtPin = {1, DHT11};
+} dhtPin = {D1, DHT11};
 
-const unsigned int buttonPin = 0;
+const unsigned int buttonPin = D0;
+const int waterLevelDataPin = A0;
 
 // Init components
 LiquidCrystal lcd(lcdPins.rs, 
@@ -55,6 +59,8 @@ DHT dht(dhtPin.data, dhtPin.type);
 unsigned long setupFinishedTime;
 unsigned long cpuTicksPerSecond;
 unsigned int cpuEvents;
+unsigned long waterLevelWaitingTime;
+bool printed;
 
 // Define the functions that will be 
 // available
@@ -66,22 +72,24 @@ String generateRandomString();
 
 void setup() {
   // Initialize the seed with a no connected pin
-  randomSeed(analogRead(0));
-  
-  #if defined(DEVMODE)
-    Serial.begin(9600);
-    Serial.println("Serial initialized");
-  #endif
+//  randomSeed(analogRead(0));
 
   // Start the web server and cautive portal
-  Server.on("/", rootPage);
-  if (Portal.begin()) {
-    Serial.println("HTTP server:" + WiFi.localIP().toString());
-  }
+//  Server.on("/", rootPage);
+//  if (Portal.begin()) {
+//    Serial.println("HTTP server:" + WiFi.localIP().toString());
+//  }
 
   // Global variables definition
   cpuTicksPerSecond = -1;
   cpuEvents = 0;
+  waterLevelWaitingTime = 0;
+  printed = false;
+  #if defined(DEVMODE)
+    delay(500);
+    Serial.begin(9600);
+    Serial.println("Serial initialized");
+  #endif
   setupFinishedTime = millis();
 }
 
@@ -93,19 +101,29 @@ void loop() {
     initCpuTicksPerSecond();
     return;
   }
-  Portal.handleClient();
+  if (!printed) {
+    Serial.print("Número de ticks por segundo: ");
+    Serial.println(cpuTicksPerSecond);
+  }
+  if (waterLevelWaitingTime == (cpuTicksPerSecond * 2)) {
+    int waterValue = analogRead(waterLevelDataPin);
+    Serial.println(waterValue);
+    waterLevelWaitingTime = 0;
+  } else
+    ++waterLevelWaitingTime;
+//  Portal.handleClient();
 }
 
 
 
 void initAutoConnect(String password) {
-  config.apid = "BonsaiAIO";
-  config.psk = password;
+//  config.apid = "BonsaiAIO";
+//  config.psk = password;
 }
 
 void rootPage() {
   char content[] = "Hello, world";
-  Server.send(200, "text/plain", content);
+//  Server.send(200, "text/plain", content);
 }
 
 void initCpuTicksPerSecond() {
