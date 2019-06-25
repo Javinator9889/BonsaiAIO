@@ -43,8 +43,8 @@ const struct {
   uint8_t type;
 } dhtPin = {D1, DHT11};
 
-const unsigned int buttonPin = D0;
-const int waterLevelDataPin = A0;
+const uint8_t buttonPin = D9;
+const uint8_t waterLevelDataPin = A0;
 
 // Init components
 LiquidCrystal lcd(lcdPins.rs, 
@@ -72,7 +72,7 @@ String generateRandomString();
 
 void setup() {
   // Initialize the seed with a no connected pin
-//  randomSeed(analogRead(0));
+  randomSeed(analogRead(0));
 
   // Start the web server and cautive portal
 //  Server.on("/", rootPage);
@@ -85,8 +85,7 @@ void setup() {
   cpuEvents = 0;
   waterLevelWaitingTime = 0;
   printed = false;
-  #if defined(DEVMODE)
-    delay(500);
+  #if DEVMODE
     Serial.begin(9600);
     Serial.println("Serial initialized");
   #endif
