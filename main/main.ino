@@ -7,14 +7,21 @@
 
 // Web control & WiFi libraries
 #include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
+#include <WiFiClientSecureBearSSL.h>
 
 // Components specific libraries
 #include <LiquidCrystal.h>
+#include <Adafruit_Sensor.h>
 #include <DHT.h>
-// Custom display modes
-#include "DisplayModes.h"
+#include <DHT_U.h>
+
+// Ticker timing
+#include <Ticker.h>
+#include <SimpleTimer.h>
 
 // Other libraries
 #include <NTPClient.h>
@@ -27,22 +34,36 @@
 // Statistics library
 #include "Statistics.h"
 
-// Ticker timing
-#include <Ticker.h>
+// Custom display modes
+#include "DisplayModes.h"
+
+// API Keys
+#include "ApiKeys.h"
 
 // Define whether the DEVMODE is active
 // for saving sketch size - set to 0 for
 // disabling
-//
-// VVV - extra verbosity
 #define DEVMODE     1
+// VVV - extra verbosity
 #define VVV         0
 
 // Maximum stats we will keep in memory
 #define MAX_STATS   256
 
+// Strings & URLs that will be used
+#define IPIFY_URL       "http://api.ipify.org/"
+#define IPSTACK_URL     "http://api.ipstack.com/%s?access_key=%s"
+#define TIMEZONE_DB_URL "http://api.timezonedb.com/v2.1/get-time-zone?key=%s&format=json&by=position&lat=%s&lng=%s"
+#define IPGEOLOCATION_URL "https://api.ipgeolocation.io/ipgeo?apiKey=%s&ip=%s&fields=time_zone"
+
+#define IPSTACK_MAX     82
+#define TIMEZONE_DB_MAX 114
+#define IPGEOLOCATION_MAX 114
+
 // Other "define" constants
-#define UTC_OFFSET  3600 // UTC+1
+//#define UTC_OFFSET  3600 // UTC+1
+#define DHT_TYPE    DHT11
+#define DHT_PIN     D1
 
 // Web control objects
 ESP8266WebServer  Server;
@@ -56,7 +77,7 @@ Statistics waterLevelStats(MAX_STATS);
 
 // Time components
 WiFiUDP ntpUDP;
-NTPClient ntp(ntpUDP, "europe.pool.ntp.org", UTC_OFFSET);
+NTPClient ntp(ntpUDP, "0.europe.pool.ntp.org");
 Thread clockThread = Thread();
 
 // Components pins
@@ -70,22 +91,19 @@ const struct {
   uint8_t d7;
 } LCD_PINS = {D7, D6, D5, D4, D3, D2};
 
-const struct {
-  uint8_t data;
-  uint8_t type;
-} DHT_PIN = {D1, DHT11};
-
 const uint8_t BUTTON_PIN = D9;
 const uint8_t WATER_LEVEL_DATA_PIN = A0;
+const uint8_t COLUMNS = 16;
+const uint8_t ROWS = 2;
 
 // Init components
-LiquidCrystal lcd(LCD_PINS.rs, 
+/*LiquidCrystal lcd(LCD_PINS.rs, 
                   LCD_PINS.e, 
                   LCD_PINS.d4, 
                   LCD_PINS.d5, 
                   LCD_PINS.d6, 
-                  LCD_PINS.d7);
-DHT dht(DHT_PIN.data, DHT_PIN.type);
+                  LCD_PINS.d7);*/
+DHT_Unified dht(DHT_PIN, DHT_TYPE);
                   
 // Global variables needed in hole project
 volatile uint8_t displayMode;
@@ -95,7 +113,6 @@ volatile uint8_t displayMode;
   volatile uint32_t cpuTicksPerSecond;
   volatile uint32_t waterLevelWaitingTime;
   volatile uint32_t aSecond = 0;
-  volatile uint32_t latestTickerExecution = 0;
   bool printed = false;
 #endif
 
@@ -105,10 +122,10 @@ volatile struct {
   float waterLevelSensor;
   float tempHumdSensor;
   float clockSeconds;
-} waitingTimes = {7200, 180, 1};
+} waitingTimes = {18, 9000, 1};
 
 struct {
-  Ticker dhtSensor;
+  SimpleTimer dhtSensor;
   Ticker waterSensor;
   Ticker clockControl;
 } sensors;
@@ -116,11 +133,14 @@ struct {
 struct {
   float latestTemperature;
   float latestHumidity;
-} dhtValues = {0.0, 0.0};
+  bool hasTempChanged;
+  bool hasHumdChanged;
+} dhtValues = {0.0, 0.0, true, true};
 
 struct {
   uint16_t waterValue;
-} waterLevelValues = {0};
+  bool hasWaterValueChanged;
+} waterLevelValues = {0, true};
 
 struct {
   String formattedTime;
@@ -130,9 +150,31 @@ struct {
   bool mustShowSeparator;
 } dataTime = {"00:00 00", "1900-01-01", true, true, true};
 
+struct {
+  String ip;
+  String lat;
+  String lng;
+  uint16_t offset; 
+} geolocationInformation = {"", "", "", 0};
+
+#if DEVMODE
+  struct {
+    volatile uint32_t latestTickerExecution;
+    volatile uint32_t latestWaterExecution;
+    volatile uint32_t latestDHTExecution;
+  } executionTimes = {0, 0, 0};
+#endif
+
+// ArduinoJson constants
+const size_t IPSTACK_BUFFER_SIZE = JSON_ARRAY_SIZE(5) + 5 * JSON_OBJECT_SIZE(3) + 
+                                   JSON_OBJECT_SIZE(8) + JSON_OBJECT_SIZE(13);
+const size_t TIMEZONE_DB_BUFFER_SIZE = 2 * JSON_OBJECT_SIZE(13);
+const size_t IPGEOLOCATION_BUFFER_SIZE = JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(6);
+
 // Define the functions that will be 
 // available
 void initAutoConnect();
+void initDHT();
 void rootPage();
 //void initCpuTicksPerSecond();
 String generateRandomString();
@@ -142,43 +184,72 @@ void updateTime();
 void updateDHTInfo();
 void updateWaterLevelInfo();
 bool areTimesDifferent(String time1, String time2);
+void getIPAddress();
+//void setupLatituteLongitude();
+void getTimezoneOffset();
+void setupClock();
 
 
 void setup() {
   #if DEVMODE
     Serial.begin(9600);
-    Serial.println("Serial initialized");
+    Serial.println(F("Serial initialized"));
   #endif
   // Initialize the seed with a no connected pin
   randomSeed(analogRead(0));
 
-  Serial.println("Starting web server and cautive portal");
+  Serial.println(F("Starting web server and cautive portal"));
   // Start the web server and cautive portal
   Server.on("/", rootPage);
   if (Portal.begin()) {
     #if DEVMODE
-      Serial.println("Successfully connected to Internet!");
-      Serial.println("HTTP server:" + WiFi.localIP().toString());
+      Serial.println(F("Successfully connected to Internet!"));
+      Serial.print(F("HTTP server:")); Serial.println(WiFi.localIP().toString());
     #endif
   } else {
     #if DEVMODE
-      Serial.println("Error connecting to Internet");
+      Serial.println(F("Error connecting to Internet"));
     #endif
   }
 
-  // Init the UTP client - if we are here there is Internet connection
-  ntp.begin();
+  // Init components
+//  lcd.begin(COLUMNS, ROWS);
+  
+  /*digitalWrite(D1, LOW); // sets output to gnd
+  pinMode(D1, OUTPUT); // switches power to DHT on
+  delay(1000); // delay necessary after power up for DHT to stabilize*/
+//  dht.begin();
+  initDHT();
   
   // Global variables definition
-  cpuTicksPerSecond     = 0;
-  cpuEvents             = 0;
-  waterLevelWaitingTime = 0;
+  #if DEVMODE
+    cpuTicksPerSecond     = 0;
+    cpuEvents             = 0;
+    waterLevelWaitingTime = 0;
+  #endif
   displayMode           = DEFAULT_MODE;
   
   #if DEVMODE
-    Serial.print("Setup elapsed time: ");
+    Serial.print(F("Setup elapsed time: "));
     Serial.println(millis());
   #endif
+
+  // Setup clock data - correct timezone (offset)
+  setupClock();
+  #if DEVMODE
+    Serial.print(F("Public IP address: "));
+    Serial.println(geolocationInformation.ip);
+    /*Serial.print(F("Latitude: "));
+    Serial.println(geolocationInformation.lat);
+    Serial.print(F("Longitude: "));
+    Serial.println(geolocationInformation.lng);*/
+    Serial.print(F("Timezone offset: "));
+    Serial.println(geolocationInformation.offset);
+  #endif
+
+  // Init the NTP client - if we are here there is Internet connection
+  ntp.setTimeOffset(geolocationInformation.offset);
+  ntp.begin();
 
   // Register button interruption
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), changeDisplayMode, CHANGE);
@@ -187,7 +258,7 @@ void setup() {
   clockThread.onRun(updateTime);
   clockThread.setInterval(1000);
 
-  sensors.dhtSensor.attach(waitingTimes.tempHumdSensor, updateDHTInfo);
+  sensors.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   sensors.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
   sensors.clockControl.attach(waitingTimes.clockSeconds, launchClockThread);
   
@@ -202,16 +273,37 @@ void setup() {
 void loop() {
   #if DEVMODE
     if (dataTime.hasDateChanged) {
-      Serial.print("Date: ");
+      Serial.print(F("Date: "));
       Serial.println(dataTime.formattedDate);
       dataTime.hasDateChanged = false;
     }
     if (dataTime.hasTimeChanged) {
-      Serial.print("Time: ");
+      Serial.print(F("Time: "));
       Serial.println(dataTime.formattedTime);
       dataTime.hasTimeChanged = false;
     }
+    if (dhtValues.hasTempChanged) {
+      Serial.print(F("Temp: ")); Serial.println(String(dhtValues.latestTemperature) + " ºC");
+      dhtValues.hasTempChanged = false;
+    }
+    if (dhtValues.hasHumdChanged) {
+      Serial.print(F("Temp: ")); Serial.println(String(dhtValues.latestHumidity) + " ºC");
+      dhtValues.hasHumdChanged = false;
+    }
+    if (waterLevelValues.hasWaterValueChanged) {
+      Serial.print(F("Water level: ")); Serial.println(String(waterLevelValues.waterValue));
+      waterLevelValues.hasWaterValueChanged = false;
+    }
   #endif
+  sensors.dhtSensor.run();
+//  delay(1000);
+//  updateDHTInfo();
+  /*Serial.print(F("Temp: ");
+  Serial.print(dhtValues.latestTemperature);
+  Serial.println(F(" ºC");
+  Serial.print(F("Humd: ");
+  Serial.print(dhtValues.latestHumidity);
+  Serial.println(F(" %");*/
   /*
    // Do not start the code until we know
    // how many ticks happens each second
@@ -221,12 +313,12 @@ void loop() {
   }
   #if DEVMODE
     if (!printed) {
-      Serial.print("Ticks per second: ");
+      Serial.print(F("Ticks per second: ");
       Serial.println(cpuTicksPerSecond);
       printed = true;
     }
     if (aSecond == cpuTicksPerSecond) {
-      Serial.println("A second has passed");
+      Serial.println(F("A second has passed");
       aSecond = 0;
     } else {
       ++aSecond;
@@ -235,7 +327,7 @@ void loop() {
   if (waterLevelWaitingTime == waitingTimes.waterLevelSensor) {
     int waterValue = analogRead(WATER_LEVEL_DATA_PIN);
     #if DEVMODE
-      Serial.print("Valor del agua: ");
+      Serial.print(F("Valor del agua: ");
       Serial.println(waterValue);
     #endif
     waterLevelWaitingTime = 0;
@@ -249,6 +341,37 @@ void loop() {
 void initAutoConnect(String password) {
   config.apid = "BonsaiAIO";
   config.psk = password;
+}
+
+void initDHT() {
+  // Initialize device.
+  dht.begin();
+  // Print temperature sensor details.
+  sensor_t sensor;
+  dht.temperature().getSensor(&sensor);
+  #if DEVMODE
+  Serial.println(F("------------------------------------"));
+  Serial.println(F("Temperature Sensor"));
+  Serial.print  (F("Sensor Type: ")); Serial.println(sensor.name);
+  Serial.print  (F("Driver Ver:  ")); Serial.println(sensor.version);
+  Serial.print  (F("Unique ID:   ")); Serial.println(sensor.sensor_id);
+  Serial.print  (F("Max Value:   ")); Serial.print(sensor.max_value); Serial.println(F("°C"));
+  Serial.print  (F("Min Value:   ")); Serial.print(sensor.min_value); Serial.println(F("°C"));
+  Serial.print  (F("Resolution:  ")); Serial.print(sensor.resolution); Serial.println(F("°C"));
+  Serial.println(F("------------------------------------"));
+  #endif
+  // Print humidity sensor details.
+  dht.humidity().getSensor(&sensor);
+  #if DEVMODE
+  Serial.println(F("Humidity Sensor"));
+  Serial.print  (F("Sensor Type: ")); Serial.println(sensor.name);
+  Serial.print  (F("Driver Ver:  ")); Serial.println(sensor.version);
+  Serial.print  (F("Unique ID:   ")); Serial.println(sensor.sensor_id);
+  Serial.print  (F("Max Value:   ")); Serial.print(sensor.max_value); Serial.println(F("%"));
+  Serial.print  (F("Min Value:   ")); Serial.print(sensor.min_value); Serial.println(F("%"));
+  Serial.print  (F("Resolution:  ")); Serial.print(sensor.resolution); Serial.println(F("%"));
+  Serial.println(F("------------------------------------"));
+  #endif
 }
 
 void rootPage() {
@@ -293,9 +416,9 @@ void launchClockThread() {
 void updateTime() {
   #if DEVMODE
     uint32_t currentTime = millis();
-    uint32_t diff = currentTime - latestTickerExecution;
-    Serial.println("Latest ticker execution about " + String(diff) + " ms. ago");
-    latestTickerExecution = currentTime;
+    uint32_t diff = currentTime - executionTimes.latestTickerExecution;
+    Serial.print(F("Latest time execution about ")); Serial.println(String(diff) + " ms. ago");
+    executionTimes.latestTickerExecution = currentTime;
   #endif
   if (WiFi.status() == WL_CONNECTED) {
     ntp.update();
@@ -330,12 +453,62 @@ void updateTime() {
 }
 
 void updateDHTInfo() {
-  dhtValues.latestTemperature = dht.readTemperature();
-  dhtValues.latestHumidity = dht.readHumidity();
+  #if DEVMODE
+    uint32_t currentTime = millis();
+    uint32_t diff = currentTime - executionTimes.latestDHTExecution;
+    Serial.print(F("Latest DHT execution about ")); Serial.println(String(diff) + " ms. ago");
+    executionTimes.latestDHTExecution = currentTime;
+  #endif*/
+  sensors_event_t event;
+  dht.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    #if DEVMODE
+    Serial.println(F("Error reading temperature!"));
+    #endif
+  }
+  else {
+    #if DEVMODE
+    Serial.print(F("Temperature: "));
+    Serial.print(event.temperature);
+    Serial.println(F("°C"));
+    #endif
+    if (event.temperature != dhtValues.latestTemperature) {
+      dhtValues.latestTemperature = event.temperature;
+      dhtValues.hasTempChanged = true;
+    }
+  }
+  // Get humidity event and print its value.
+  dht.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    #if DEVMODE
+    Serial.println(F("Error reading humidity!"));
+    #endif
+  }
+  else {
+    #if DEVMODE
+    Serial.print(F("Humidity: "));
+    Serial.print(event.relative_humidity);
+    Serial.println(F("%"));
+    #endif
+    if (event.relative_humidity != dhtValues.latestHumidity) {
+      dhtValues.latestHumidity = event.relative_humidity;
+      dhtValues.hasHumdChanged = true;
+    }
+  }
 }
 
 void updateWaterLevelInfo() {
-  waterLevelValues.waterValue = analogRead(WATER_LEVEL_DATA_PIN);
+  #if DEVMODE
+    uint32_t currentTime = millis();
+    uint32_t diff = currentTime - executionTimes.latestWaterExecution;
+    Serial.print(F("Latest water execution about ")); Serial.print(String(diff) + " ms. ago");
+    executionTimes.latestWaterExecution = currentTime;
+  #endif  
+  uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
+  if (currentWaterValue != waterLevelValues.waterValue) {
+    waterLevelValues.waterValue = currentWaterValue;
+    waterLevelValues.hasWaterValueChanged = true;
+  }
 }
 
 bool areTimesDifferent(String time1, String time2) {
@@ -352,4 +525,94 @@ bool areTimesDifferent(String time1, String time2) {
     return true;
   else
     return false;
+}
+
+void getIPAddress() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    #if DEVMODE
+      Serial.print(F("ipify URL: "));
+      Serial.println(IPIFY_URL);
+    #endif
+    http.begin(IPIFY_URL);
+    if (http.GET() == 200) {
+      geolocationInformation.ip = http.getString();
+    }
+    http.end();
+  }
+}
+
+/*void setupLatituteLongitude() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    char *formattedUrl = new char[IPSTACK_MAX];
+    sprintf(formattedUrl, IPSTACK_URL, geolocationInformation.ip.c_str(), IPSTACK);
+    #if DEVMODE
+      Serial.print(F("IPSTACK URL: "));
+      Serial.println(formattedUrl);
+    #endif
+    http.begin(formattedUrl);
+    if (http.GET() == 200) {
+      DynamicJsonDocument jsonBuffer(IPSTACK_BUFFER_SIZE);
+      DeserializationError error = deserializeJson(jsonBuffer, http.getString());
+      if (error == DeserializationError::Ok) {
+        geolocationInformation.lat = String((float) jsonBuffer["latitude"], 6);
+        geolocationInformation.lng = String((float) jsonBuffer["longitude"], 6);
+      } else {
+        #if DEVMODE
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+        #endif
+      }
+      jsonBuffer.clear();
+    }
+    delete[] formattedUrl;
+    http.end();
+  }
+}*/
+
+void getTimezoneOffset() {
+  if (WiFi.status() == WL_CONNECTED) {
+    std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
+    client->setInsecure();
+    HTTPClient https;
+    char *formattedUrl = new char[IPGEOLOCATION_MAX];
+    sprintf(formattedUrl, IPGEOLOCATION_URL, IPGEOLOCATION, geolocationInformation.ip.c_str());
+    #if DEVMODE
+      Serial.print(F("IPGEOLOCATION URL: "));
+      Serial.println(formattedUrl);
+    #endif
+    https.begin(formattedUrl);
+    int httpsCode = https.GET();
+    if (httpsCode == 200) {
+      DynamicJsonDocument jsonBuffer(IPGEOLOCATION_BUFFER_SIZE);
+      DeserializationError error = deserializeJson(jsonBuffer, https.getString());
+      if (error == DeserializationError::Ok) {
+//        JsonObject time_zone = jsonBuffer["time_zone"];
+        #if DEVMODE
+          Serial.println(jsonBuffer["time_zone"]["offset"].as<int>());
+          Serial.println(jsonBuffer["time_zone"]["dst_savings"].as<int>());
+        #endif
+        int offset = jsonBuffer["time_zone"]["offset"];
+        int dst = jsonBuffer["time_zone"]["dst_savings"];
+        geolocationInformation.offset = offset + dst;
+      } else {
+        #if DEVMODE
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+        #endif
+      }
+      jsonBuffer.clear();
+    } else {
+      Serial.printf("[HTTPS] GET... failed, error: %s\n\r", https.errorToString(httpsCode).c_str());
+    }
+    delete[] formattedUrl;
+    https.end();
+  }
+}
+
+void setupClock() {
+  getIPAddress();
+//  setupLatituteLongitude();
+  getTimezoneOffset();
 }
