@@ -33,7 +33,10 @@
 // Define whether the DEVMODE is active
 // for saving sketch size - set to 0 for
 // disabling
+//
+// VVV - extra verbosity
 #define DEVMODE     1
+#define VVV         0
 
 // Maximum stats we will keep in memory
 #define MAX_STATS   256
@@ -85,22 +88,23 @@ LiquidCrystal lcd(LCD_PINS.rs,
 DHT dht(DHT_PIN.data, DHT_PIN.type);
                   
 // Global variables needed in hole project
-volatile uint32_t setupFinishedTime;
-volatile uint32_t cpuEvents;
-volatile uint32_t cpuTicksPerSecond;
-volatile uint32_t waterLevelWaitingTime;
-volatile uint8_t  displayMode;
+volatile uint8_t displayMode;
 #if DEVMODE
+  volatile uint32_t setupFinishedTime;
+  volatile uint32_t cpuEvents;
+  volatile uint32_t cpuTicksPerSecond;
+  volatile uint32_t waterLevelWaitingTime;
   volatile uint32_t aSecond = 0;
+  volatile uint32_t latestTickerExecution = 0;
   bool printed = false;
 #endif
 
 // Constant structs that contains
 // application data
 volatile struct {
-  uint32_t waterLevelSensor;
-  uint32_t tempHumdSensor;
-  uint32_t clockSeconds;
+  float waterLevelSensor;
+  float tempHumdSensor;
+  float clockSeconds;
 } waitingTimes = {7200, 180, 1};
 
 struct {
@@ -118,21 +122,26 @@ struct {
   uint16_t waterValue;
 } waterLevelValues = {0};
 
-// Other useful variables
-String formattedTime = "00:00 00";
-bool mustShowSeparator;
+struct {
+  String formattedTime;
+  String formattedDate;
+  bool hasTimeChanged;
+  bool hasDateChanged;
+  bool mustShowSeparator;
+} dataTime = {"00:00 00", "1900-01-01", true, true, true};
 
 // Define the functions that will be 
 // available
 void initAutoConnect();
 void rootPage();
-void initCpuTicksPerSecond();
+//void initCpuTicksPerSecond();
 String generateRandomString();
-void changeDisplayMode();
+ICACHE_RAM_ATTR void changeDisplayMode();
 void launchClockThread();
 void updateTime();
 void updateDHTInfo();
 void updateWaterLevelInfo();
+bool areTimesDifferent(String time1, String time2);
 
 
 void setup() {
@@ -165,7 +174,6 @@ void setup() {
   cpuEvents             = 0;
   waterLevelWaitingTime = 0;
   displayMode           = DEFAULT_MODE;
-  mustShowSeparator     = true;
   
   #if DEVMODE
     Serial.print("Setup elapsed time: ");
@@ -192,9 +200,22 @@ void setup() {
 
 
 void loop() {
-  // Do not start the code until we know
-  // how many ticks happens each second
-  /*if (cpuTicksPerSecond == 0) {
+  #if DEVMODE
+    if (dataTime.hasDateChanged) {
+      Serial.print("Date: ");
+      Serial.println(dataTime.formattedDate);
+      dataTime.hasDateChanged = false;
+    }
+    if (dataTime.hasTimeChanged) {
+      Serial.print("Time: ");
+      Serial.println(dataTime.formattedTime);
+      dataTime.hasTimeChanged = false;
+    }
+  #endif
+  /*
+   // Do not start the code until we know
+   // how many ticks happens each second
+   if (cpuTicksPerSecond == 0) {
     initCpuTicksPerSecond();
     return;
   }
@@ -236,9 +257,9 @@ void rootPage() {
 }
 
 /**
- * Unised since "Ticker" installation
+ * Unused since "Ticker" installation
  */
-void initCpuTicksPerSecond() {
+/*void initCpuTicksPerSecond() {
   uint32_t timeDifference = (uint32_t) (millis() - setupFinishedTime);
   ++cpuEvents;
   if (timeDifference >= 999) {
@@ -247,7 +268,7 @@ void initCpuTicksPerSecond() {
     waitingTimes.tempHumdSensor *= cpuTicksPerSecond;
     waitingTimes.clockSeconds *= cpuTicksPerSecond;
   }
-}
+}*/
 
 String generateRandomString() {
   const char* letters = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -265,18 +286,46 @@ void changeDisplayMode() {
 }
 
 void launchClockThread() {
+//  if (clockThread.shouldRun())
   clockThread.run();
 }
 
 void updateTime() {
+  #if DEVMODE
+    uint32_t currentTime = millis();
+    uint32_t diff = currentTime - latestTickerExecution;
+    Serial.println("Latest ticker execution about " + String(diff) + " ms. ago");
+    latestTickerExecution = currentTime;
+  #endif
   if (WiFi.status() == WL_CONNECTED) {
     ntp.update();
-    formattedTime = ntp.getHours();
-    formattedTime += (mustShowSeparator) ? ":" : " ";
-    formattedTime += ntp.getMinutes() + " " + ntp.getSeconds();
-    mustShowSeparator = !mustShowSeparator;
+
+    // Format the date
+    String ntpFormattedDate = ntp.getFormattedDate();
+    int splitIndexForDate = ntpFormattedDate.indexOf("T");
+    String formattedDate = ntpFormattedDate.substring(0, splitIndexForDate);
+    if (formattedDate != dataTime.formattedDate) {
+      dataTime.formattedDate = formattedDate;
+      dataTime.hasDateChanged = true;
+    } else {
+      dataTime.hasDateChanged = false;
+    }
+
+    // Format the time
+    String ntpTime = ntpFormattedDate.substring((splitIndexForDate + 1), (ntpFormattedDate.length() - 1));
+    String formattedTime = ntpTime.substring(0, 2);
+    formattedTime += (dataTime.mustShowSeparator) ? ":" : " ";
+    formattedTime += ntpTime.substring(3, 5) + " " + ntpTime.substring(6, 8);
+    if (areTimesDifferent(formattedTime, dataTime.formattedTime)) {
+      dataTime.formattedTime = formattedTime;
+      dataTime.mustShowSeparator = !dataTime.mustShowSeparator;
+      dataTime.hasTimeChanged = true;
+    } else {
+      dataTime.hasTimeChanged = false;
+    }
   } else {
-    formattedTime = "No Internet!";
+    dataTime.formattedTime = "No Internet!";
+    dataTime.formattedDate = "";
   }
 }
 
@@ -287,4 +336,20 @@ void updateDHTInfo() {
 
 void updateWaterLevelInfo() {
   waterLevelValues.waterValue = analogRead(WATER_LEVEL_DATA_PIN);
+}
+
+bool areTimesDifferent(String time1, String time2) {
+  #if VVV
+    Serial.println(time1.substring(0, 2) + " | " + time2.substring(0, 2));
+    Serial.println(time1.substring(3, 5) + " | " + time2.substring(3, 5));
+    Serial.println(time1.substring(6, 8) + " | " + time2.substring(6, 8));
+  #endif
+  if (time1.substring(0, 2) != time2.substring(0, 2))
+    return true;
+  else if (time1.substring(3, 5) != time2.substring(3, 5))
+    return true;
+  else if (time1.substring(6, 8) != time2.substring(6, 8))
+    return true;
+  else
+    return false;
 }
