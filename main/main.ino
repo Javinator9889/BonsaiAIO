@@ -11,7 +11,7 @@
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
-#include <WiFiClientSecureBearSSL.h>
+//#include <WiFiClientSecureBearSSL.h>
 
 // Components specific libraries
 #include <LiquidCrystal.h>
@@ -52,13 +52,18 @@
 
 // Strings & URLs that will be used
 #define IPIFY_URL       "http://api.ipify.org/"
-#define IPSTACK_URL     "http://api.ipstack.com/%s?access_key=%s"
+//#define IPSTACK_URL     "http://api.ipstack.com/%s?access_key=%s"
 #define TIMEZONE_DB_URL "http://api.timezonedb.com/v2.1/get-time-zone?key=%s&format=json&by=position&lat=%s&lng=%s"
-#define IPGEOLOCATION_URL "https://api.ipgeolocation.io/ipgeo?apiKey=%s&ip=%s&fields=time_zone"
+//#define IPGEOLOCATION_URL "https://api.ipgeolocation.io/ipgeo?apiKey=%s&ip=%s&fields=time_zone"
+//#define IPGEOLOCATION_BASE "https://api.ipgeolocation.io"
+#define IPAPI             "http://ip-api.com/json/%s"
+#define EXTREME_IP_URL    "http://extreme-ip-lookup.com/json/"
 
-#define IPSTACK_MAX     82
+//#define IPSTACK_MAX     82
 #define TIMEZONE_DB_MAX 114
+#define IPAPI_MAX         38
 #define IPGEOLOCATION_MAX 114
+#define EXTREME_IP_MAX  34
 
 // Other "define" constants
 //#define UTC_OFFSET  3600 // UTC+1
@@ -166,10 +171,12 @@ struct {
 #endif
 
 // ArduinoJson constants
-const size_t IPSTACK_BUFFER_SIZE = JSON_ARRAY_SIZE(5) + 5 * JSON_OBJECT_SIZE(3) + 
-                                   JSON_OBJECT_SIZE(8) + JSON_OBJECT_SIZE(13);
-const size_t TIMEZONE_DB_BUFFER_SIZE = 2 * JSON_OBJECT_SIZE(13);
-const size_t IPGEOLOCATION_BUFFER_SIZE = JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(6);
+/*const size_t IPSTACK_BUFFER_SIZE = JSON_ARRAY_SIZE(5) + 5 * JSON_OBJECT_SIZE(3) + 
+                                   JSON_OBJECT_SIZE(8) + JSON_OBJECT_SIZE(13);*/
+//const size_t IPAPI_BUFFER_SIZE = 3 * JSON_OBJECT_SIZE(14);
+const size_t TIMEZONE_DB_BUFFER_SIZE = JSON_OBJECT_SIZE(13) + 226;
+const size_t EXTREME_IP_BUFFER_SIZE = JSON_OBJECT_SIZE(15) + 286;
+//const size_t IPGEOLOCATION_BUFFER_SIZE = JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(6);
 
 // Define the functions that will be 
 // available
@@ -185,7 +192,7 @@ void updateDHTInfo();
 void updateWaterLevelInfo();
 bool areTimesDifferent(String time1, String time2);
 void getIPAddress();
-//void setupLatituteLongitude();
+void setupLatituteLongitude();
 void getTimezoneOffset();
 void setupClock();
 
@@ -193,6 +200,7 @@ void setupClock();
 void setup() {
   #if DEVMODE
     Serial.begin(9600);
+    while (!Serial) {;}
     Serial.println(F("Serial initialized"));
   #endif
   // Initialize the seed with a no connected pin
@@ -237,12 +245,12 @@ void setup() {
   // Setup clock data - correct timezone (offset)
   setupClock();
   #if DEVMODE
-    Serial.print(F("Public IP address: "));
-    Serial.println(geolocationInformation.ip);
-    /*Serial.print(F("Latitude: "));
+//    Serial.print(F("Public IP address: "));
+//    Serial.println(geolocationInformation.ip);
+    Serial.print(F("Latitude: "));
     Serial.println(geolocationInformation.lat);
     Serial.print(F("Longitude: "));
-    Serial.println(geolocationInformation.lng);*/
+    Serial.println(geolocationInformation.lng);
     Serial.print(F("Timezone offset: "));
     Serial.println(geolocationInformation.offset);
   #endif
@@ -276,23 +284,28 @@ void loop() {
       Serial.print(F("Date: "));
       Serial.println(dataTime.formattedDate);
       dataTime.hasDateChanged = false;
+      delay(10);
     }
     if (dataTime.hasTimeChanged) {
       Serial.print(F("Time: "));
       Serial.println(dataTime.formattedTime);
       dataTime.hasTimeChanged = false;
+      delay(10);
     }
     if (dhtValues.hasTempChanged) {
       Serial.print(F("Temp: ")); Serial.println(String(dhtValues.latestTemperature) + " ºC");
       dhtValues.hasTempChanged = false;
+      delay(10);
     }
     if (dhtValues.hasHumdChanged) {
-      Serial.print(F("Temp: ")); Serial.println(String(dhtValues.latestHumidity) + " ºC");
+      Serial.print(F("Humd: ")); Serial.println(String(dhtValues.latestHumidity) + " %");
       dhtValues.hasHumdChanged = false;
+      delay(10);
     }
     if (waterLevelValues.hasWaterValueChanged) {
       Serial.print(F("Water level: ")); Serial.println(String(waterLevelValues.waterValue));
       waterLevelValues.hasWaterValueChanged = false;
+      delay(10);
     }
   #endif
   sensors.dhtSensor.run();
@@ -467,7 +480,7 @@ void updateDHTInfo() {
     #endif
   }
   else {
-    #if DEVMODE
+    #if VVV
     Serial.print(F("Temperature: "));
     Serial.print(event.temperature);
     Serial.println(F("°C"));
@@ -485,7 +498,7 @@ void updateDHTInfo() {
     #endif
   }
   else {
-    #if DEVMODE
+    #if VVV
     Serial.print(F("Humidity: "));
     Serial.print(event.relative_humidity);
     Serial.println(F("%"));
@@ -542,77 +555,79 @@ void getIPAddress() {
   }
 }
 
-/*void setupLatituteLongitude() {
+void setupLatituteLongitude() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    char *formattedUrl = new char[IPSTACK_MAX];
-    sprintf(formattedUrl, IPSTACK_URL, geolocationInformation.ip.c_str(), IPSTACK);
     #if DEVMODE
-      Serial.print(F("IPSTACK URL: "));
-      Serial.println(formattedUrl);
+      Serial.print(F("EXTREME URL: "));
+      Serial.println(EXTREME_IP_URL);
     #endif
-    http.begin(formattedUrl);
-    if (http.GET() == 200) {
-      DynamicJsonDocument jsonBuffer(IPSTACK_BUFFER_SIZE);
+    http.begin(EXTREME_IP_URL);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      DynamicJsonDocument jsonBuffer(EXTREME_IP_BUFFER_SIZE);
       DeserializationError error = deserializeJson(jsonBuffer, http.getString());
       if (error == DeserializationError::Ok) {
-        geolocationInformation.lat = String((float) jsonBuffer["latitude"], 6);
-        geolocationInformation.lng = String((float) jsonBuffer["longitude"], 6);
+        #if DEVMODE
+          Serial.println(jsonBuffer["lat"].as<float>());
+          Serial.println(jsonBuffer["lon"].as<float>());
+        #endif
+        geolocationInformation.lat = jsonBuffer["lat"].as<String>();
+        geolocationInformation.lng = jsonBuffer["lon"].as<String>();
       } else {
         #if DEVMODE
-          Serial.print(F("deserializeJson() failed with code "));
+          Serial.print(F("\"IP-API\" deserializeJson() failed with code "));
           Serial.println(error.c_str());
         #endif
       }
       jsonBuffer.clear();
     }
-    delete[] formattedUrl;
+    else {
+      #if DEVMODE
+      Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
+      #endif
+    }
     http.end();
   }
-}*/
+}
 
 void getTimezoneOffset() {
   if (WiFi.status() == WL_CONNECTED) {
-    std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
-    client->setInsecure();
-    HTTPClient https;
-    char *formattedUrl = new char[IPGEOLOCATION_MAX];
-    sprintf(formattedUrl, IPGEOLOCATION_URL, IPGEOLOCATION, geolocationInformation.ip.c_str());
+    HTTPClient http;
+    char *formattedUrl = new char[TIMEZONE_DB_MAX];
+    sprintf(formattedUrl, TIMEZONE_DB_URL, TIMEZONE_DB, geolocationInformation.lat.c_str(), geolocationInformation.lng.c_str());
     #if DEVMODE
-      Serial.print(F("IPGEOLOCATION URL: "));
+      Serial.print(F("TIMEZONE DB URL: "));
       Serial.println(formattedUrl);
     #endif
-    https.begin(formattedUrl);
-    int httpsCode = https.GET();
-    if (httpsCode == 200) {
-      DynamicJsonDocument jsonBuffer(IPGEOLOCATION_BUFFER_SIZE);
-      DeserializationError error = deserializeJson(jsonBuffer, https.getString());
+    http.begin(formattedUrl);
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      DynamicJsonDocument jsonBuffer(TIMEZONE_DB_BUFFER_SIZE);
+      DeserializationError error = deserializeJson(jsonBuffer, http.getString());
       if (error == DeserializationError::Ok) {
-//        JsonObject time_zone = jsonBuffer["time_zone"];
         #if DEVMODE
-          Serial.println(jsonBuffer["time_zone"]["offset"].as<int>());
-          Serial.println(jsonBuffer["time_zone"]["dst_savings"].as<int>());
+          Serial.println(jsonBuffer["gmtOffset"].as<int>());
         #endif
-        int offset = jsonBuffer["time_zone"]["offset"];
-        int dst = jsonBuffer["time_zone"]["dst_savings"];
-        geolocationInformation.offset = offset + dst;
+        geolocationInformation.offset = jsonBuffer["gmtOffset"].as<int>();
       } else {
         #if DEVMODE
-          Serial.print(F("deserializeJson() failed with code "));
+          Serial.print("\"timezone\" deserializeJson() failed with code ");
           Serial.println(error.c_str());
         #endif
       }
       jsonBuffer.clear();
     } else {
-      Serial.printf("[HTTPS] GET... failed, error: %s\n\r", https.errorToString(httpsCode).c_str());
+      #if DEVMODE
+      Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
+      #endif
     }
     delete[] formattedUrl;
-    https.end();
+    http.end();
   }
 }
 
 void setupClock() {
-  getIPAddress();
-//  setupLatituteLongitude();
+  setupLatituteLongitude();
   getTimezoneOffset();
 }
