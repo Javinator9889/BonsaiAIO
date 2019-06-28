@@ -73,7 +73,7 @@
 #define EXTREME_IP_MAX  34
 
 // Other "define" constants
-//#define UTC_OFFSET  3600 // UTC+1
+#define NTP_SERVER  "0.europe.pool.ntp.org"
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
 
@@ -89,8 +89,9 @@ Statistics waterLevelStats(MAX_STATS);
 
 // Time components
 WiFiUDP ntpUDP;
-NTPClient ntp(ntpUDP, "0.europe.pool.ntp.org");
+NTPClient ntp(ntpUDP, NTP_SERVER);
 Thread clockThread = Thread();
+Thread offsetTask  = Thread();
 
 // Components pins
 const struct {
@@ -131,15 +132,17 @@ bool printed = false;
 // Constant structs that contains
 // application data
 volatile struct {
-  float waterLevelSensor;
-  float tempHumdSensor;
-  float clockSeconds;
-} waitingTimes = {18, 9000, 1};
+  uint16_t waterLevelSensor;
+  uint16_t tempHumdSensor;
+  uint16_t clockSeconds;
+  uint32_t offsetSeconds;
+} waitingTimes = {18, 9000, 1, 86400};
 
 struct {
   SimpleTimer dhtSensor;
   Ticker waterSensor;
   Ticker clockControl;
+  Ticker offsetControl;
   #if OTA_ENABLED
   SimpleTimer ota;
   #endif
@@ -199,9 +202,11 @@ bool areTimesDifferent(String time1, String time2);
 void setupLatituteLongitude();
 void getTimezoneOffset();
 void setupClock();
+void launchOffsetTask();
 #if OTA_ENABLED
 void lookForOTAUpdates();
 #endif
+
 
 void setup() {
 #if DEVMODE
@@ -257,7 +262,6 @@ void setup() {
 
   // Setup clock data - correct timezone (offset)
   setupClock();
-  delay(2000);
 #if DEVMODE
   Serial.print(F("Latitude: "));
   Serial.println(geolocationInformation.lat);
@@ -265,6 +269,7 @@ void setup() {
   Serial.println(geolocationInformation.lng);
   Serial.print(F("Timezone offset: "));
   Serial.println(geolocationInformation.offset);
+  delay(2000);
 #endif
 
   // Init the NTP client - if we are here there is Internet connection
@@ -285,6 +290,7 @@ void setup() {
   timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
   timers.clockControl.attach(waitingTimes.clockSeconds, launchClockThread);
+  timers.offsetControl.attach(waitingTimes.offsetSeconds, launchOffsetTask);
 
   updateDHTInfo();
   updateWaterLevelInfo();
@@ -294,7 +300,6 @@ void setup() {
   setupFinishedTime = millis();
 #endif
 }
-
 
 void loop() {
 #if DEVMODE
@@ -391,7 +396,6 @@ void changeDisplayMode() {
 }
 
 void launchClockThread() {
-  //  if (clockThread.shouldRun())
   clockThread.run();
 }
 
@@ -584,6 +588,10 @@ void getTimezoneOffset() {
 void setupClock() {
   setupLatituteLongitude();
   getTimezoneOffset();
+}
+
+void launchOffsetTask() {
+  offsetTask.run();
 }
 
 #if OTA_ENABLED
