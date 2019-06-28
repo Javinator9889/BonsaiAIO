@@ -17,7 +17,6 @@
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
-//#include <Arduino.h>
 
 // Ticker timing
 #include <Ticker.h>
@@ -27,6 +26,7 @@
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <Thread.h>
+#include <ThingSpeak.h>
 
 // ESP8266 pinout
 #include "PinConstants.h"
@@ -90,8 +90,16 @@ Statistics waterLevelStats(MAX_STATS);
 // Time components
 WiFiUDP ntpUDP;
 NTPClient ntp(ntpUDP, NTP_SERVER);
-Thread clockThread = Thread();
-Thread offsetTask  = Thread();
+
+// Threads
+struct {
+  Thread clockThread;
+  Thread offsetTask;
+  Thread wifiTask;
+  Thread tempTask;
+  Thread humdTask;
+  Thread wlvlTask;
+} tasks = {Thread(), Thread(), Thread(), Thread(), Thread(), Thread()};
 
 // Components pins
 const struct {
@@ -136,13 +144,30 @@ volatile struct {
   uint16_t tempHumdSensor;
   uint16_t clockSeconds;
   uint32_t offsetSeconds;
-} waitingTimes = {18, 9000, 1, 86400};
+  uint32_t wifiTaskSeconds;
+  uint32_t tempTaskSeconds;
+  uint32_t humdTaskSeconds;
+  uint32_t wlvlTaskSeconds;
+} waitingTimes = {
+  18,       // 18 seconds
+  9000,     // 09 seconds
+  1,        // 01 second
+  86400,    // 01 day
+  600,      // 10 minutes
+  300,      // 05 minutes
+  300,      // 05 minutes
+  1800      // 30 minutes
+};
 
 struct {
   SimpleTimer dhtSensor;
   Ticker waterSensor;
   Ticker clockControl;
   Ticker offsetControl;
+  Ticker wifiTask;
+  Ticker tempTask;
+  Ticker humdTask;
+  Ticker wlvlTask;
   #if OTA_ENABLED
   SimpleTimer ota;
   #endif
@@ -156,7 +181,7 @@ struct {
 } dhtValues = {0.0, 0.0, true, true};
 
 struct {
-  uint16_t waterValue;
+  float waterValue;
   bool hasWaterValueChanged;
 } waterLevelValues = {0, true};
 
@@ -174,6 +199,19 @@ struct {
   String lng;
   uint16_t offset;
 } geolocationInformation = {"", "", "", 0};
+
+// MQTT information
+struct {
+  const struct {
+    uint8_t wifiStrength;
+    uint8_t temperature;
+    uint8_t humidity;
+    uint8_t waterLevel;
+  } fields;
+  WiFiClient client;
+  uint32_t channelId;
+  const char *apiKey;
+} mqtt = {{1, 2, 3, 4}, WiFiClient(), CHANNEL_ID, THINGSPEAK_API};
 
 #if DEVMODE
 struct {
@@ -203,6 +241,14 @@ void setupLatituteLongitude();
 void getTimezoneOffset();
 void setupClock();
 void launchOffsetTask();
+void launchWiFiMQTTTask();
+void launchTempMQTTTask();
+void launchHumdMQTTTask();
+void launchWLvlMQTTTask();
+void publishWiFiStrength();
+void publishTemperature();
+void publishHumidity();
+void publishWaterLevel();
 #if OTA_ENABLED
 void lookForOTAUpdates();
 #endif
@@ -227,7 +273,6 @@ void setup() {
 #endif
   // Initialize the seed with a no connected pin
   randomSeed(analogRead(0));
-//  pinMode(LED_BUILTIN, OUTPUT);     // Initialize the LED_BUILTIN pin as an output
 
   Serial.println(F("Starting web server and cautive portal"));
   // Start the web server and cautive portal
@@ -276,14 +321,26 @@ void setup() {
   ntp.setTimeOffset(geolocationInformation.offset);
   ntp.begin();
 
+  // Init ThingSpeak as we have network
+  ThingSpeak.begin(mqtt.client);
+
   // Register button interruption
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), changeDisplayMode, CHANGE);
 
   // Setup timers
-  clockThread.onRun(updateTime);
-  clockThread.setInterval(1000);
+  tasks.clockThread.onRun(updateTime);
+  tasks.clockThread.setInterval(waitingTimes.clockSeconds * 1000);
+  tasks.offsetTask.onRun(setupClock);
+  tasks.offsetTask.setInterval(waitingTimes.offsetSeconds * 1000);
+  tasks.wifiTask.onRun(publishWiFiStrength);
+  tasks.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000);
+  tasks.tempTask.onRun(publishTemperature);
+  tasks.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000);
+  tasks.humdTask.onRun(publishHumidity);
+  tasks.humdTask.setInterval(waitingTimes.humdTaskSeconds * 1000);
+  tasks.wlvlTask.onRun(publishWaterLevel);
+  tasks.wlvlTask.setInterval(waitingTimes.wlvlTaskSeconds * 1000);
 
-//  blink.setInterval(1000, bblink);
 #if OTA_ENABLED
   timers.ota.setInterval(5000, lookForOTAUpdates);
 #endif
@@ -291,6 +348,10 @@ void setup() {
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
   timers.clockControl.attach(waitingTimes.clockSeconds, launchClockThread);
   timers.offsetControl.attach(waitingTimes.offsetSeconds, launchOffsetTask);
+  timers.wifiTask.attach(waitingTimes.wifiTaskSeconds, launchWiFiMQTTTask);
+  timers.tempTask.attach(waitingTimes.tempTaskSeconds, launchTempMQTTTask);
+  timers.humdTask.attach(waitingTimes.humdTaskSeconds, launchHumdMQTTTask);
+  timers.wlvlTask.attach(waitingTimes.wlvlTaskSeconds, launchWLvlMQTTTask);
 
   updateDHTInfo();
   updateWaterLevelInfo();
@@ -396,7 +457,7 @@ void changeDisplayMode() {
 }
 
 void launchClockThread() {
-  clockThread.run();
+  tasks.clockThread.run();
 }
 
 void updateTime() {
@@ -483,6 +544,10 @@ void updateDHTInfo() {
   }
 }
 
+float normalizeWaterLevelValue(uint16_t initialValue) {
+  return ((initialValue / 300) * 100);
+}
+
 void updateWaterLevelInfo() {
 #if DEVMODE
   uint32_t currentTime = millis();
@@ -491,8 +556,9 @@ void updateWaterLevelInfo() {
   executionTimes.latestWaterExecution = currentTime;
 #endif
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
-  if (currentWaterValue != waterLevelValues.waterValue) {
-    waterLevelValues.waterValue = currentWaterValue;
+  float percentageWaterValue = normalizeWaterLevelValue(currentWaterValue);
+  if (percentageWaterValue != waterLevelValues.waterValue) {
+    waterLevelValues.waterValue = percentageWaterValue;
     waterLevelValues.hasWaterValueChanged = true;
   }
 }
@@ -560,7 +626,7 @@ void getTimezoneOffset() {
     #endif
     http.begin(formattedUrl);
     int httpCode = http.GET();
-    if (httpCode == 200) {
+    if (httpCode > 0) {
       DynamicJsonDocument jsonBuffer(TIMEZONE_DB_BUFFER_SIZE);
       DeserializationError error = deserializeJson(jsonBuffer, http.getString());
       if (error == DeserializationError::Ok) {
@@ -591,7 +657,96 @@ void setupClock() {
 }
 
 void launchOffsetTask() {
-  offsetTask.run();
+  tasks.offsetTask.run();
+}
+
+void launchWiFiMQTTTask() {
+  tasks.wifiTask.run();
+}
+
+void launchTempMQTTTask() {
+  tasks.tempTask.run();
+}
+
+void launchHumdMQTTTask() {
+  tasks.humdTask.run();
+}
+
+void launchWLvlMQTTTask() {
+  tasks.wlvlTask.run();
+}
+
+void publishWiFiStrength() {
+  long rssi = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    rssi = WiFi.RSSI();
+    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.wifiStrength, rssi, mqtt.apiKey);
+#if DEVMODE
+    if (httpCode == 200) {
+      Serial.println("Correctly published WiFi Strength");
+    } else {
+      Serial.printf("Problem publishing WiFi Strength - error code: %i", httpCode);
+    }
+#endif
+  } else {
+#if DEVMODE
+    Serial.println(F("No Internet connection"));
+#endif
+  }
+}
+
+void publishTemperature() {
+  if (WiFi.status() == WL_CONNECTED) {
+    
+    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, dhtValues.latestTemperature, mqtt.apiKey);
+#if DEVMODE
+    if (httpCode == 200) {
+      Serial.println("Correctly published Temperature");
+    } else {
+      Serial.printf("Problem publishing Temperature - error code: %i", httpCode);
+    }
+#endif
+  } else {
+#if DEVMODE
+    Serial.println(F("No Internet connection"));
+#endif
+  }
+}
+
+void publishHumidity() {
+  if (WiFi.status() == WL_CONNECTED) {
+    
+    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.humidity, dhtValues.latestHumidity, mqtt.apiKey);
+#if DEVMODE
+    if (httpCode == 200) {
+      Serial.println("Correctly published Humidity");
+    } else {
+      Serial.printf("Problem publishing Humidity - error code: %i", httpCode);
+    }
+#endif
+  } else {
+#if DEVMODE
+    Serial.println(F("No Internet connection"));
+#endif
+  }
+}
+
+void publishWaterLevel() {
+  if (WiFi.status() == WL_CONNECTED) {
+    
+    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, waterLevelValues.waterValue, mqtt.apiKey);
+#if DEVMODE
+    if (httpCode == 200) {
+      Serial.println("Correctly published Water Value");
+    } else {
+      Serial.printf("Problem publishing Water Value - error code: %i", httpCode);
+    }
+#endif
+  } else {
+#if DEVMODE
+    Serial.println(F("No Internet connection"));
+#endif
+  }
 }
 
 #if OTA_ENABLED
