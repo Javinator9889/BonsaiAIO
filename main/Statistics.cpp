@@ -4,10 +4,11 @@
  */
 
 #include <limits.h>
+#include <stdint.h>
 #include "Statistics.h"
 
-Statistics::Statistics(unsigned int maximumSize) {
-    *_measures = new measure[maximumSize]{
+Statistics::Statistics(uint32_t maximumSize) {
+    *_measures = new measure[maximumSize] {
         {0.0, "", false}
     };
     _maximumSize = maximumSize;
@@ -35,7 +36,7 @@ int Statistics::add(float element, char *time) {
 
 int Statistics::getCurrentAmountOfElements() {
     int elements = 0;
-    for (int i = 0; i < _maximumSize; ++i)
+    for (uint32_t i = (_maximumSize - 1); i >= 0; --i)
     {
         if (_measures[i]->init)
         {
@@ -61,7 +62,7 @@ measure Statistics::getMinimum() {
 float Statistics::calculateMean() {
     int   elements = 0;
     float sum = 0.0;
-    for (int i = 0; i < _maximumSize; i++)
+    for (uint32_t i = (_maximumSize - 1); i >= 0; --i)
     {
         if (_measures[i]->init)
         {
