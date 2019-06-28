@@ -8,6 +8,7 @@
 // Web control & WiFi libraries
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
@@ -58,6 +59,12 @@
 //#define IPGEOLOCATION_BASE "https://api.ipgeolocation.io"
 #define IPAPI             "http://ip-api.com/json/%s"
 #define EXTREME_IP_URL    "http://extreme-ip-lookup.com/json/"
+
+// OTA static constant values
+#define OTA_URL           "http://ota.javinator9889.com"
+#define OTA_PORT          80
+#define OTA_PATH          "/esp8266/update/arduino.php"
+#define RUNNING_VERSION   "0.9b"
 
 //#define IPSTACK_MAX     82
 #define TIMEZONE_DB_MAX 114
@@ -195,12 +202,24 @@ void getIPAddress();
 void setupLatituteLongitude();
 void getTimezoneOffset();
 void setupClock();
+void lookForOTAUpdates();
 
 
 void setup() {
   #if DEVMODE
     Serial.begin(9600);
-    while (!Serial) {;}
+    Serial.println();
+    Serial.println();
+    Serial.println();
+
+    for (uint8_t t = 4; t > 0; --t) {
+      Serial.printf("[SERIAL SETUP] Wait %d...\n", t);
+      Serial.flush();
+      delay(1000);
+    }
+    while (!Serial) {
+      continue;
+    }
     Serial.println(F("Serial initialized"));
   #endif
   // Initialize the seed with a no connected pin
@@ -630,4 +649,31 @@ void getTimezoneOffset() {
 void setupClock() {
   setupLatituteLongitude();
   getTimezoneOffset();
+}
+
+void lookForOTAUpdates() {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    #if DEVMODE
+    ESPhttpUpdate.setLedPin(LED_BUILTIN, LOW);
+    #endif
+    t_httpUpdate_return returnValue = ESPhttpUpdate.update(OTA_URL, OTA_PORT, OTA_PATH, RUNNING_VERSION);
+    switch(returnValue) {
+    case HTTP_UPDATE_FAILED:
+      #if DEVMODE
+        Serial.println("[update] Update failed.");
+      #endif
+        break;
+    case HTTP_UPDATE_NO_UPDATES:
+      #if DEVMODE
+        Serial.println("[update] Update no Update.");
+      #endif
+        break;
+    case HTTP_UPDATE_OK:
+      #if DEVMODE
+        Serial.println("[update] Update ok."); // may not called we reboot the ESP
+      #endif
+        break;
+    }
+  }
 }
