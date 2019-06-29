@@ -7,4 +7,5 @@ static const uint8_t CLOCK_WATER_LEVEL     = 3;
 static const uint8_t CLOCK_AVG_TMP_HUM     = 4;
 static const uint8_t CLOCK_AND_DATE        = 5;
 static const uint8_t WIFI_INFORMATION      = 6;
+static const uint8_t N_DISPLAY_MODES       = 7;
 #endif

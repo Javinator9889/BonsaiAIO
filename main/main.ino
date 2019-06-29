@@ -40,6 +40,12 @@
 // API Keys
 #include "ApiKeys.h"
 
+// Water value calculator
+#include "WaterValues.h"
+
+// LCD Icons
+#include "LCDIcons.h"
+
 // Define whether the DEVMODE is active
 // for saving sketch size - set to 0 for
 // disabling
@@ -76,6 +82,7 @@
 #define NTP_SERVER  "0.europe.pool.ntp.org"
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
+#define CLEAR_ROW   "                "
 
 // Web control objects
 ESP8266WebServer  Server;
@@ -86,6 +93,9 @@ AutoConnectConfig config;
 Statistics tempStats(MAX_STATS);
 Statistics humdStats(MAX_STATS);
 Statistics waterLevelStats(MAX_STATS);
+
+// WaterValue object
+WaterValues waterValue(250, 120);
 
 // Time components
 WiFiUDP ntpUDP;
@@ -168,9 +178,9 @@ struct {
   Ticker tempTask;
   Ticker humdTask;
   Ticker wlvlTask;
-  #if OTA_ENABLED
+#if OTA_ENABLED
   SimpleTimer ota;
-  #endif
+#endif
 } timers;
 
 struct {
@@ -225,12 +235,20 @@ struct {
 const size_t TIMEZONE_DB_BUFFER_SIZE = JSON_OBJECT_SIZE(13) + 226;
 const size_t EXTREME_IP_BUFFER_SIZE = JSON_OBJECT_SIZE(15) + 286;
 
+// Other global variables
+bool setupExecuted = false;
+volatile String password;
+volatile uint8_t displayMode = 0;
+
 // Define the functions that will be
 // available
-void initAutoConnect();
+void initAutoConnect(String password);
 void initDHT();
+void initWaterValuesPercentages();
+void createLCDCustomCharacters();
 void rootPage();
 String generateRandomString();
+void printLCDCaptivePortalInformation();
 ICACHE_RAM_ATTR void changeDisplayMode();
 void launchClockThread();
 void updateTime();
@@ -271,26 +289,38 @@ void setup() {
   }
   Serial.println(F("Serial initialized"));
 #endif
-  // Initialize the seed with a no connected pin
-  randomSeed(analogRead(0));
 
+  // Init components
+  lcd.begin(COLUMNS, ROWS);
+  initDHT();
+  initWaterValuesPercentages();
+  createLCDCustomCharacters();
+
+  password = generateRandomString();
+  initAutoConnect(password);
+#if DEVMODE
   Serial.println(F("Starting web server and cautive portal"));
+  Serial.printf("AP SSID: BonsaiAIO\n\rAP password: %s", password);
+#endif
   // Start the web server and cautive portal
   Server.on("/", rootPage);
+  Portal.config(config);
+  Portal.onDetect(printLCDCaptivePortalInformation);
   if (Portal.begin()) {
 #if DEVMODE
     Serial.println(F("Successfully connected to Internet!"));
     Serial.print(F("HTTP server:")); Serial.println(WiFi.localIP().toString());
 #endif
+    lcd.clear();
+    lcd.home();
+    lcd.print("WiFi connected!");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString());
   } else {
 #if DEVMODE
     Serial.println(F("Error connecting to Internet"));
 #endif
   }
-
-  // Init components
-  lcd.begin(COLUMNS, ROWS);
-  initDHT();
 
   // Global variables definition
 #if DEVMODE
@@ -397,6 +427,42 @@ void loop() {
   timers.ota.run();
 #endif
   Portal.handleClient();
+  switch(displayMode) {
+    case DEFAULT_MODE:
+      if (dataTime.hasTimeChanged) {
+        lcd.home();
+        lcd.print(CLEAR_ROW);
+        lcd.home();
+        lcd.print(F("    "));
+        lcd.print(dataTime.formattedTime);
+        lcd.print(F("    "));
+      }
+      if (dhtValues.hasTempChanged) {
+        lcd.setCursor(0, 1);
+        lcd.print(F(" "));
+        lcd.write(TERMOMETER.id);
+        lcd.setCursor(2, 1);
+        lcd.print(dhtValues.latestTemperature);
+        lcd.print(F(" ºC  "));
+        lcd.write(WATER_DROP.id);
+        lcd.print(dhtValues.latestHumidity);
+      }
+      break;
+    case AVG_TEMP_HUM_MODE:
+      break;
+    case WATER_LEVEL_INDICATOR:
+      break;
+    case CLOCK_WATER_LEVEL:
+      break;
+    case CLOCK_AVG_TMP_HUM:
+      break;
+    case CLOCK_AND_DATE:
+      break;
+    case WIFI_INFORMATION:
+      break;
+    default:
+      break;
+  }
 }
 
 
@@ -436,6 +502,28 @@ void initDHT() {
 #endif
 }
 
+void initWaterValuesPercentages() {
+  uint8_t initialValue = 250;
+  for (uint8_t percentage = 90; percentage >= 10; (percentage - 10)) {
+    waterValue.setPercentageLimit(percentage, initialValue, (initialValue - 10));
+    initialValue -= 10;
+  }
+}
+
+void createLCDCustomCharacters() {
+  lcd.createChar(WATER_DROP.id, WATER_DROP.icon);
+  lcd.createChar(TERMOMETER.id, TERMOMETER.icon);
+  lcd.createChar(AVG.id, AVG.icon);
+  lcd.createChar(WIFI.id, WIFI.icon);
+  lcd.createChar(KEY.id, KEY.icon);
+  lcd.createChar(WATER_LEVEL_EMPTY.id, WATER_LEVEL_EMPTY.icon);
+  lcd.createChar(WATER_LEVEL_25.id, WATER_LEVEL_25.icon);
+  lcd.createChar(WATER_LEVEL_50.id, WATER_LEVEL_50.icon);
+  lcd.createChar(WATER_LEVEL_75.id, WATER_LEVEL_75.icon);
+  lcd.createChar(WATER_LEVEL_100.id, WATER_LEVEL_100.icon);
+  lcd.createChar(WARNING.id, WARNING.icon);
+}
+
 void rootPage() {
   char content[] = "Hello, world";
   Server.send(200, "text/plain", content);
@@ -452,8 +540,21 @@ String generateRandomString() {
   return randomString;
 }
 
+void printLCDCaptivePortalInformation() {
+  if ((!setupExecuted) || (displayMode == WIFI_INFORMATION)) {
+    lcd.home();
+    lcd.write(WIFI.id);
+    lcd.setCursor(2, 0);
+    lcd.print("BonsaiAIO");
+    lcd.setCursor(0, 1);
+    lcd.write(KEY.id);
+    lcd.setCursor(2, 1);
+    lcd.print(password);
+  }
+}
+
 void changeDisplayMode() {
-  // TODO
+  displayMode = (displayMode + 1) % N_DISPLAY_MODES;
 }
 
 void launchClockThread() {
@@ -582,34 +683,34 @@ bool areTimesDifferent(String time1, String time2) {
 void setupLatituteLongitude() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    #if DEVMODE
-      Serial.print(F("EXTREME URL: "));
-      Serial.println(EXTREME_IP_URL);
-    #endif
+#if DEVMODE
+    Serial.print(F("EXTREME URL: "));
+    Serial.println(EXTREME_IP_URL);
+#endif
     http.begin(EXTREME_IP_URL);
     int httpCode = http.GET();
     if (httpCode > 0) {
       DynamicJsonDocument jsonBuffer(EXTREME_IP_BUFFER_SIZE);
       DeserializationError error = deserializeJson(jsonBuffer, http.getString());
       if (error == DeserializationError::Ok) {
-        #if DEVMODE
-          Serial.println(jsonBuffer["lat"].as<float>());
-          Serial.println(jsonBuffer["lon"].as<float>());
-        #endif
+#if DEVMODE
+        Serial.println(jsonBuffer["lat"].as<float>());
+        Serial.println(jsonBuffer["lon"].as<float>());
+#endif
         geolocationInformation.lat = jsonBuffer["lat"].as<String>();
         geolocationInformation.lng = jsonBuffer["lon"].as<String>();
       } else {
-        #if DEVMODE
-          Serial.print(F("\"IP-API\" deserializeJson() failed with code "));
-          Serial.println(error.c_str());
-        #endif
+#if DEVMODE
+        Serial.print(F("\"IP-API\" deserializeJson() failed with code "));
+        Serial.println(error.c_str());
+#endif
       }
       jsonBuffer.clear();
     }
     else {
-      #if DEVMODE
+#if DEVMODE
       Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
-      #endif
+#endif
     }
     http.end();
   }
@@ -620,31 +721,31 @@ void getTimezoneOffset() {
     HTTPClient http;
     char *formattedUrl = new char[TIMEZONE_DB_MAX];
     sprintf(formattedUrl, TIMEZONE_DB_URL, TIMEZONE_DB, geolocationInformation.lat.c_str(), geolocationInformation.lng.c_str());
-    #if DEVMODE
-      Serial.print(F("TIMEZONE DB URL: "));
-      Serial.println(formattedUrl);
-    #endif
+#if DEVMODE
+    Serial.print(F("TIMEZONE DB URL: "));
+    Serial.println(formattedUrl);
+#endif
     http.begin(formattedUrl);
     int httpCode = http.GET();
     if (httpCode > 0) {
       DynamicJsonDocument jsonBuffer(TIMEZONE_DB_BUFFER_SIZE);
       DeserializationError error = deserializeJson(jsonBuffer, http.getString());
       if (error == DeserializationError::Ok) {
-        #if DEVMODE
-          Serial.println(jsonBuffer["gmtOffset"].as<int>());
-        #endif
+#if DEVMODE
+        Serial.println(jsonBuffer["gmtOffset"].as<int>());
+#endif
         geolocationInformation.offset = jsonBuffer["gmtOffset"].as<int>();
       } else {
-        #if DEVMODE
-          Serial.print("\"timezone\" deserializeJson() failed with code ");
-          Serial.println(error.c_str());
-        #endif
+#if DEVMODE
+        Serial.print("\"timezone\" deserializeJson() failed with code ");
+        Serial.println(error.c_str());
+#endif
       }
       jsonBuffer.clear();
     } else {
-      #if DEVMODE
+#if DEVMODE
       Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
-      #endif
+#endif
     }
     delete[] formattedUrl;
     http.end();
@@ -697,7 +798,7 @@ void publishWiFiStrength() {
 
 void publishTemperature() {
   if (WiFi.status() == WL_CONNECTED) {
-    
+
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, dhtValues.latestTemperature, mqtt.apiKey);
 #if DEVMODE
     if (httpCode == 200) {
@@ -715,7 +816,7 @@ void publishTemperature() {
 
 void publishHumidity() {
   if (WiFi.status() == WL_CONNECTED) {
-    
+
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.humidity, dhtValues.latestHumidity, mqtt.apiKey);
 #if DEVMODE
     if (httpCode == 200) {
@@ -733,7 +834,7 @@ void publishHumidity() {
 
 void publishWaterLevel() {
   if (WiFi.status() == WL_CONNECTED) {
-    
+
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, waterLevelValues.waterValue, mqtt.apiKey);
 #if DEVMODE
     if (httpCode == 200) {
