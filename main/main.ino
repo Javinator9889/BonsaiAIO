@@ -92,7 +92,6 @@ AutoConnectConfig config;
 // Statistics object
 Statistics tempStats(MAX_STATS);
 Statistics humdStats(MAX_STATS);
-Statistics waterLevelStats(MAX_STATS);
 
 // WaterValue object
 WaterValues waterValue(250, 120);
@@ -137,7 +136,7 @@ LiquidCrystal lcd(LCD_PINS.rs,
 DHT_Unified dht(DHT_PIN, DHT_TYPE);
 
 // Global variables needed in hole project
-volatile uint8_t displayMode;
+volatile uint8_t displayMode = DEFAULT_MODE;
 #if DEVMODE
 volatile uint32_t setupFinishedTime;
 volatile uint32_t cpuEvents;
@@ -158,15 +157,17 @@ volatile struct {
   uint32_t tempTaskSeconds;
   uint32_t humdTaskSeconds;
   uint32_t wlvlTaskSeconds;
+  uint32_t statisticsTaskSeconds;
 } waitingTimes = {
   18,       // 18 seconds
   9000,     // 09 seconds
   1,        // 01 second
-  86400,    // 01 day
+  1800 ,    // 30 minutes
   600,      // 10 minutes
   300,      // 05 minutes
   300,      // 05 minutes
-  1800      // 30 minutes
+  1800,     // 30 minutes
+  170       // 02 minutes 50 secs
 };
 
 struct {
@@ -178,6 +179,7 @@ struct {
   Ticker tempTask;
   Ticker humdTask;
   Ticker wlvlTask;
+  Ticker updateStatistics;
 #if OTA_ENABLED
   SimpleTimer ota;
 #endif
@@ -191,7 +193,7 @@ struct {
 } dhtValues = {0.0, 0.0, true, true};
 
 struct {
-  float waterValue;
+  uint8_t waterValue;
   bool hasWaterValueChanged;
 } waterLevelValues = {0, true};
 
@@ -237,42 +239,50 @@ const size_t EXTREME_IP_BUFFER_SIZE = JSON_OBJECT_SIZE(15) + 286;
 
 // Other global variables
 bool setupExecuted = false;
-volatile String password;
-volatile uint8_t displayMode = 0;
+bool displayModeChanged = false;
+String password;
+volatile bool hasDisplayModeBeenPrinted[N_DISPLAY_MODES] = {false};
 
 // Define the functions that will be
 // available
 void initAutoConnect(String password);
-void initDHT();
-void initWaterValuesPercentages();
-void createLCDCustomCharacters();
-void rootPage();
-String generateRandomString();
-void printLCDCaptivePortalInformation();
-ICACHE_RAM_ATTR void changeDisplayMode();
-void launchClockThread();
-void updateTime();
-void updateDHTInfo();
-void updateWaterLevelInfo();
+void initDHT(void);
+void initWaterValuesPercentages(void);
+void createLCDCustomCharacters(void);
+void lcdPrintTime(void);
+void lcdPrintDHT(void);
+void lcdPrintWaterLevel(void);
+void lcdPrintDate(void);
+void lcdPrintAvgDHT(void);
+void lcdPrintWiFiInformation(void);
+void rootPage(void);
+String generateRandomString(void);
+bool printLCDCaptivePortalInformation(IPAddress ip);
+ICACHE_RAM_ATTR void changeDisplayMode(void);
+void launchClockThread(void);
+void updateTime(void);
+void updateDHTInfo(void);
+void updateWaterLevelInfo(void);
 bool areTimesDifferent(String time1, String time2);
-void setupLatituteLongitude();
-void getTimezoneOffset();
-void setupClock();
-void launchOffsetTask();
-void launchWiFiMQTTTask();
-void launchTempMQTTTask();
-void launchHumdMQTTTask();
-void launchWLvlMQTTTask();
-void publishWiFiStrength();
-void publishTemperature();
-void publishHumidity();
-void publishWaterLevel();
+void setupLatituteLongitude(void);
+void getTimezoneOffset(void);
+void setupClock(void);
+void launchOffsetTask(void);
+void launchWiFiMQTTTask(void);
+void launchTempMQTTTask(void);
+void launchHumdMQTTTask(void);
+void launchWLvlMQTTTask(void);
+void publishWiFiStrength(void);
+void publishTemperature(void);
+void publishHumidity(void);
+void publishWaterLevel(void);
+void statisticsUpdate(void);
 #if OTA_ENABLED
-void lookForOTAUpdates();
+void lookForOTAUpdates(void);
 #endif
 
 
-void setup() {
+void setup(void) {
 #if DEVMODE
   Serial.begin(9600);
   Serial.println();
@@ -300,7 +310,7 @@ void setup() {
   initAutoConnect(password);
 #if DEVMODE
   Serial.println(F("Starting web server and cautive portal"));
-  Serial.printf("AP SSID: BonsaiAIO\n\rAP password: %s", password);
+  Serial.printf("AP SSID: BonsaiAIO\n\rAP password: %s", password.c_str());
 #endif
   // Start the web server and cautive portal
   Server.on("/", rootPage);
@@ -348,7 +358,6 @@ void setup() {
 #endif
 
   // Init the NTP client - if we are here there is Internet connection
-  ntp.setTimeOffset(geolocationInformation.offset);
   ntp.begin();
 
   // Init ThingSpeak as we have network
@@ -382,17 +391,19 @@ void setup() {
   timers.tempTask.attach(waitingTimes.tempTaskSeconds, launchTempMQTTTask);
   timers.humdTask.attach(waitingTimes.humdTaskSeconds, launchHumdMQTTTask);
   timers.wlvlTask.attach(waitingTimes.wlvlTaskSeconds, launchWLvlMQTTTask);
+  timers.updateStatistics.attach(waitingTimes.statisticsTaskSeconds, statisticsUpdate);
 
   updateDHTInfo();
   updateWaterLevelInfo();
   updateTime();
+  statisticsUpdate();
 
 #if DEVMODE
   setupFinishedTime = millis();
 #endif
 }
 
-void loop() {
+void loop(void) {
 #if DEVMODE
   if (dataTime.hasDateChanged) {
     Serial.print(F("Date: "));
@@ -429,49 +440,38 @@ void loop() {
   Portal.handleClient();
   switch(displayMode) {
     case DEFAULT_MODE:
-      if (dataTime.hasTimeChanged) {
-        lcd.home();
-        lcd.print(CLEAR_ROW);
-        lcd.home();
-        lcd.print(F("    "));
-        lcd.print(dataTime.formattedTime);
-        lcd.print(F("    "));
-      }
-      if (dhtValues.hasTempChanged) {
-        lcd.setCursor(0, 1);
-        lcd.print(F(" "));
-        lcd.write(TERMOMETER.id);
-        lcd.setCursor(2, 1);
-        lcd.print(dhtValues.latestTemperature);
-        lcd.print(F(" ºC  "));
-        lcd.write(WATER_DROP.id);
-        lcd.print(dhtValues.latestHumidity);
-      }
+      lcdPrintTime();
+      lcdPrintDHT();
       break;
     case AVG_TEMP_HUM_MODE:
+      lcdPrintTime();
+      lcdPrintAvgDHT();
       break;
     case WATER_LEVEL_INDICATOR:
-      break;
-    case CLOCK_WATER_LEVEL:
-      break;
-    case CLOCK_AVG_TMP_HUM:
+      lcdPrintTime();
+      lcdPrintWaterLevel();
       break;
     case CLOCK_AND_DATE:
+      lcdPrintTime();
+      lcdPrintDate();
       break;
     case WIFI_INFORMATION:
-      break;
+      lcdPrintWiFiInformation();
     default:
+      displayMode = DEFAULT_MODE;
       break;
   }
+  
 }
 
 
 void initAutoConnect(String password) {
   config.apid = "BonsaiAIO";
   config.psk = password;
+  config.retainPortal = true;
 }
 
-void initDHT() {
+void initDHT(void) {
   // Initialize device.
   dht.begin();
   // Print temperature sensor details.
@@ -502,7 +502,7 @@ void initDHT() {
 #endif
 }
 
-void initWaterValuesPercentages() {
+void initWaterValuesPercentages(void) {
   uint8_t initialValue = 250;
   for (uint8_t percentage = 90; percentage >= 10; (percentage - 10)) {
     waterValue.setPercentageLimit(percentage, initialValue, (initialValue - 10));
@@ -510,7 +510,7 @@ void initWaterValuesPercentages() {
   }
 }
 
-void createLCDCustomCharacters() {
+void createLCDCustomCharacters(void) {
   lcd.createChar(WATER_DROP.id, WATER_DROP.icon);
   lcd.createChar(TERMOMETER.id, TERMOMETER.icon);
   lcd.createChar(AVG.id, AVG.icon);
@@ -524,12 +524,124 @@ void createLCDCustomCharacters() {
   lcd.createChar(WARNING.id, WARNING.icon);
 }
 
-void rootPage() {
+void lcdPrintTime(void) {
+  if (dataTime.hasTimeChanged || displayModeChanged) {
+    lcd.home();
+    lcd.print(CLEAR_ROW);
+    lcd.home();
+    lcd.print(F("    "));
+    lcd.print(dataTime.formattedTime);
+    lcd.print(F("    "));
+    dataTime.hasTimeChanged = false;
+    if (displayModeChanged)
+      displayModeChanged = false;
+  }
+}
+
+void lcdPrintDHT(void) {
+  if (dhtValues.hasTempChanged || displayModeChanged) {
+    lcd.setCursor(0, 1);
+    lcd.print(F(" "));
+    lcd.write(TERMOMETER.id);
+    lcd.print(dhtValues.latestTemperature, 1);
+    lcd.print(F(" ºC"));
+    dhtValues.hasTempChanged = false;
+  }
+  if (dhtValues.hasHumdChanged || displayModeChanged) {
+    lcd.setCursor(9, 1);
+    lcd.print(F("  "));
+    lcd.write(WATER_DROP.id);
+    lcd.print(dhtValues.latestHumidity, 0);
+    lcd.print(F("%"));
+    dhtValues.hasHumdChanged = false;
+  }
+  if (displayModeChanged)
+      displayModeChanged = false;
+}
+
+void lcdPrintWaterLevel(void) {
+  if (waterLevelValues.hasWaterValueChanged || displayModeChanged) {
+    lcd.setCursor(0, 1);
+    lcd.print(CLEAR_ROW);
+    if (waterLevelValues.waterValue < 25) {
+      lcd.setCursor(4, 1);
+      lcd.write(WARNING.id);
+      lcd.print(F(" "));
+      lcd.write(WATER_LEVEL_EMPTY.id);
+    } else if ((waterLevelValues.waterValue >= 25) && (waterLevelValues.waterValue < 50)) {
+      lcd.setCursor(6, 1);
+      lcd.write(WATER_LEVEL_25.id);
+    } else if ((waterLevelValues.waterValue >= 50) && (waterLevelValues.waterValue < 75)) {
+      lcd.setCursor(6, 1);
+      lcd.write(WATER_LEVEL_50.id);
+    } else if (waterLevelValues.waterValue >= 75 && (waterLevelValues.waterValue < 90)) {
+      lcd.setCursor(6, 1);
+      lcd.write(WATER_LEVEL_75.id);
+    } else if (waterLevelValues.waterValue >= 90) {
+      lcd.setCursor(6, 1);
+      lcd.write(WATER_LEVEL_100.id);
+    }
+    lcd.print(F(" "));
+    lcd.print(waterLevelValues.waterValue);
+    lcd.print(F("%"));
+    if (displayModeChanged)
+      displayModeChanged = false;
+  }
+}
+
+void lcdPrintDate(void) {
+  if (dataTime.hasDateChanged || displayModeChanged) {
+    lcd.setCursor(0, 1);
+    lcd.print(CLEAR_ROW);
+    lcd.setCursor(3, 1);
+    lcd.print(dataTime.formattedDate);
+    if (displayModeChanged)
+      displayModeChanged = false;
+  }
+}
+
+void lcdPrintAvgDHT(void) {
+  if (dhtValues.hasTempChanged || displayModeChanged) {
+    lcd.setCursor(0, 1);
+    lcd.write(AVG.id);
+    lcd.write(TERMOMETER.id);
+    lcd.print(tempStats.calculateMean(), 1);
+    lcd.print(F(" ºC"));
+    dhtValues.hasTempChanged = false;
+  }
+  if (dhtValues.hasHumdChanged || displayModeChanged) {
+    lcd.setCursor(9, 1);
+    lcd.print(F(" "));
+    lcd.write(AVG.id);
+    lcd.write(WATER_DROP.id);
+    lcd.print(humdStats.calculateMean(), 0);
+    lcd.print(F("%"));
+    dhtValues.hasHumdChanged = false;
+  }
+  if (displayModeChanged)
+      displayModeChanged = false;
+}
+
+void lcdPrintWiFiInformation(void) {
+  if (WiFi.status() == WL_CONNECTED) {
+    lcd.clear();
+    lcd.print(WiFi.SSID().c_str());
+    lcd.setCursor(0, 1);
+    lcd.write(WIFI.id);
+    lcd.print(F(" "));
+    lcd.print(WiFi.RSSI());
+    lcd.print(F(" dBm"));
+  } else {
+    printLCDCaptivePortalInformation(IPAddress(255, 255, 255, 255));
+  }
+}
+
+void rootPage(void) {
   char content[] = "Hello, world";
   Server.send(200, "text/plain", content);
 }
 
-String generateRandomString() {
+String generateRandomString(void) {
   const char* letters = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   int position = -1;
   String randomString = "";
@@ -540,7 +652,7 @@ String generateRandomString() {
   return randomString;
 }
 
-void printLCDCaptivePortalInformation() {
+bool printLCDCaptivePortalInformation(IPAddress ip) {
   if ((!setupExecuted) || (displayMode == WIFI_INFORMATION)) {
     lcd.home();
     lcd.write(WIFI.id);
@@ -551,17 +663,19 @@ void printLCDCaptivePortalInformation() {
     lcd.setCursor(2, 1);
     lcd.print(password);
   }
+  return true;
 }
 
-void changeDisplayMode() {
+void changeDisplayMode(void) {
   displayMode = (displayMode + 1) % N_DISPLAY_MODES;
+  displayModeChanged = true;
 }
 
-void launchClockThread() {
+void launchClockThread(void) {
   tasks.clockThread.run();
 }
 
-void updateTime() {
+void updateTime(void) {
 #if DEVMODE
   uint32_t currentTime = millis();
   uint32_t diff = currentTime - executionTimes.latestTickerExecution;
@@ -600,7 +714,7 @@ void updateTime() {
   }
 }
 
-void updateDHTInfo() {
+void updateDHTInfo(void) {
 #if DEVMODE
   uint32_t currentTime = millis();
   uint32_t diff = currentTime - executionTimes.latestDHTExecution;
@@ -645,11 +759,7 @@ void updateDHTInfo() {
   }
 }
 
-float normalizeWaterLevelValue(uint16_t initialValue) {
-  return ((initialValue / 300) * 100);
-}
-
-void updateWaterLevelInfo() {
+void updateWaterLevelInfo(void) {
 #if DEVMODE
   uint32_t currentTime = millis();
   uint32_t diff = currentTime - executionTimes.latestWaterExecution;
@@ -657,7 +767,7 @@ void updateWaterLevelInfo() {
   executionTimes.latestWaterExecution = currentTime;
 #endif
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
-  float percentageWaterValue = normalizeWaterLevelValue(currentWaterValue);
+  uint8_t percentageWaterValue = waterValue.normalizeValue(currentWaterValue);
   if (percentageWaterValue != waterLevelValues.waterValue) {
     waterLevelValues.waterValue = percentageWaterValue;
     waterLevelValues.hasWaterValueChanged = true;
@@ -680,7 +790,7 @@ bool areTimesDifferent(String time1, String time2) {
     return false;
 }
 
-void setupLatituteLongitude() {
+void setupLatituteLongitude(void) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
 #if DEVMODE
@@ -716,7 +826,7 @@ void setupLatituteLongitude() {
   }
 }
 
-void getTimezoneOffset() {
+void getTimezoneOffset(void) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     char *formattedUrl = new char[TIMEZONE_DB_MAX];
@@ -752,32 +862,33 @@ void getTimezoneOffset() {
   }
 }
 
-void setupClock() {
+void setupClock(void) {
   setupLatituteLongitude();
   getTimezoneOffset();
+  ntp.setTimeOffset(geolocationInformation.offset);
 }
 
-void launchOffsetTask() {
+void launchOffsetTask(void) {
   tasks.offsetTask.run();
 }
 
-void launchWiFiMQTTTask() {
+void launchWiFiMQTTTask(void) {
   tasks.wifiTask.run();
 }
 
-void launchTempMQTTTask() {
+void launchTempMQTTTask(void) {
   tasks.tempTask.run();
 }
 
-void launchHumdMQTTTask() {
+void launchHumdMQTTTask(void) {
   tasks.humdTask.run();
 }
 
-void launchWLvlMQTTTask() {
+void launchWLvlMQTTTask(void) {
   tasks.wlvlTask.run();
 }
 
-void publishWiFiStrength() {
+void publishWiFiStrength(void) {
   long rssi = 0;
   if (WiFi.status() == WL_CONNECTED) {
     rssi = WiFi.RSSI();
@@ -796,7 +907,7 @@ void publishWiFiStrength() {
   }
 }
 
-void publishTemperature() {
+void publishTemperature(void) {
   if (WiFi.status() == WL_CONNECTED) {
 
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, dhtValues.latestTemperature, mqtt.apiKey);
@@ -814,7 +925,7 @@ void publishTemperature() {
   }
 }
 
-void publishHumidity() {
+void publishHumidity(void) {
   if (WiFi.status() == WL_CONNECTED) {
 
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.humidity, dhtValues.latestHumidity, mqtt.apiKey);
@@ -832,7 +943,7 @@ void publishHumidity() {
   }
 }
 
-void publishWaterLevel() {
+void publishWaterLevel(void) {
   if (WiFi.status() == WL_CONNECTED) {
 
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, waterLevelValues.waterValue, mqtt.apiKey);
@@ -850,8 +961,15 @@ void publishWaterLevel() {
   }
 }
 
+void statisticsUpdate(void) {
+  char *currentTime;
+  (dataTime.formattedTime + "/" + dataTime.formattedDate).toCharArray(currentTime, 19);
+  tempStats.add(dhtValues.latestTemperature, currentTime);
+  humdStats.add(dhtValues.latestHumidity, currentTime);
+}
+
 #if OTA_ENABLED
-void lookForOTAUpdates() {
+void lookForOTAUpdates(void) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClient client;
 #if DEVMODE
