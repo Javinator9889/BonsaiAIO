@@ -14,6 +14,7 @@
 
 // Components specific libraries
 #include <LiquidCrystal.h>
+#include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
@@ -32,7 +33,7 @@
 #include "PinConstants.h"
 
 // Statistics library
-#include "Statistics.h"
+//#include "Statistics.h"
 
 // Custom display modes
 #include "DisplayModes.h"
@@ -41,7 +42,7 @@
 #include "ApiKeys.h"
 
 // Water value calculator
-#include "WaterValues.h"
+//#include "WaterValues.h"
 
 // LCD Icons
 #include "LCDIcons.h"
@@ -61,7 +62,7 @@
 #endif
 
 // Maximum stats we will keep in memory
-#define MAX_STATS   256
+#define MAX_STATS   512
 
 // Strings & URLs that will be used
 #define TIMEZONE_DB_URL   "http://api.timezonedb.com/v2.1/get-time-zone?key=%s&format=json&by=position&lat=%s&lng=%s"
@@ -83,6 +84,8 @@
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
 #define CLEAR_ROW   "                "
+#define UPPER_LIMIT 250
+#define LOWER_LIMIT 120
 
 // Web control objects
 ESP8266WebServer  Server;
@@ -90,11 +93,11 @@ AutoConnect       Portal(Server);
 AutoConnectConfig config;
 
 // Statistics object
-Statistics tempStats(MAX_STATS);
-Statistics humdStats(MAX_STATS);
+//Statistics tempStats(MAX_STATS);
+//Statistics humdStats(MAX_STATS);
 
 // WaterValue object
-WaterValues waterValue(250, 120);
+//WaterValues waterValue(250, 120);
 
 // Time components
 WiFiUDP ntpUDP;
@@ -225,6 +228,28 @@ struct {
   const char *apiKey;
 } mqtt = {{1, 2, 3, 4}, WiFiClient(), CHANNEL_ID, THINGSPEAK_API};
 
+// Custom types definition
+typedef struct {
+  float element;
+  bool initialized;
+} measure;
+
+typedef struct {
+  int16_t upperLimit;
+  int16_t lowerLimit;
+} percentagesLimit;
+
+struct {
+  measure tempStats[MAX_STATS];
+  measure humdStats[MAX_STATS];
+  uint16_t tempCurrentElement;
+  uint16_t humdCurrentElement;
+} statistics = {{0, false}, {0, false}, 0, 0};
+
+struct {
+  percentagesLimit percentageLimit[11];
+} waterLevelPercentages = {{0, 0}};
+
 #if DEVMODE
 struct {
   volatile uint32_t latestTickerExecution;
@@ -277,6 +302,9 @@ void publishTemperature(void);
 void publishHumidity(void);
 void publishWaterLevel(void);
 void statisticsUpdate(void);
+float getTempMean(void);
+float getHumdMean(void);
+uint8_t normalizeValue(uint16_t analogValue);
 #if OTA_ENABLED
 void lookForOTAUpdates(void);
 #endif
@@ -304,13 +332,19 @@ void setup(void) {
   lcd.begin(COLUMNS, ROWS);
   initDHT();
   initWaterValuesPercentages();
-  createLCDCustomCharacters();
+//  createLCDCustomCharacters();
+
+  /*lcd.home();
+  lcd.print(F("   "));
+  lcd.write(BONSAI.id);
+  lcd.print("BonsaiAIO");*/
+  delay(2000);
 
   password = generateRandomString();
   initAutoConnect(password);
 #if DEVMODE
   Serial.println(F("Starting web server and cautive portal"));
-  Serial.printf("AP SSID: BonsaiAIO\n\rAP password: %s", password.c_str());
+  Serial.printf("AP SSID: BonsaiAIO\n\rAP password: %s\n\r", password.c_str());
 #endif
   // Start the web server and cautive portal
   Server.on("/", rootPage);
@@ -325,6 +359,7 @@ void setup(void) {
     lcd.home();
     lcd.print("WiFi connected!");
     lcd.setCursor(0, 1);
+    lcd.print("IP: ");
     lcd.print(WiFi.localIP().toString());
   } else {
 #if DEVMODE
@@ -461,7 +496,6 @@ void loop(void) {
       displayMode = DEFAULT_MODE;
       break;
   }
-  
 }
 
 
@@ -503,11 +537,38 @@ void initDHT(void) {
 }
 
 void initWaterValuesPercentages(void) {
-  uint8_t initialValue = 250;
-  for (uint8_t percentage = 90; percentage >= 10; (percentage - 10)) {
+//  uint8_t initialValue = 250;
+  /*for (uint8_t percentage = 90; percentage >= 10; (percentage - 10)) {
     waterValue.setPercentageLimit(percentage, initialValue, (initialValue - 10));
     initialValue -= 10;
-  }
+  }*/
+  /*waterValue.setPercentageLimit(90, 250, 240);
+  waterValue.setPercentageLimit(80, 240, 230);
+  waterValue.setPercentageLimit(70, 230, 220);
+  waterValue.setPercentageLimit(60, 220, 210);
+  waterValue.setPercentageLimit(50, 210, 200);
+  waterValue.setPercentageLimit(40, 200, 190);
+  waterValue.setPercentageLimit(30, 190, 180);
+  waterValue.setPercentageLimit(20, 180, 150);
+  waterValue.setPercentageLimit(10, 150, 120);*/
+  waterLevelPercentages.percentageLimit[9].upperLimit = 250;
+  waterLevelPercentages.percentageLimit[9].lowerLimit = 240;
+  waterLevelPercentages.percentageLimit[8].upperLimit = 240;
+  waterLevelPercentages.percentageLimit[8].lowerLimit = 230;
+  waterLevelPercentages.percentageLimit[7].upperLimit = 230;
+  waterLevelPercentages.percentageLimit[7].lowerLimit = 220;
+  waterLevelPercentages.percentageLimit[6].upperLimit = 220;
+  waterLevelPercentages.percentageLimit[6].lowerLimit = 210;
+  waterLevelPercentages.percentageLimit[5].upperLimit = 210;
+  waterLevelPercentages.percentageLimit[5].lowerLimit = 200;
+  waterLevelPercentages.percentageLimit[4].upperLimit = 200;
+  waterLevelPercentages.percentageLimit[4].lowerLimit = 190;
+  waterLevelPercentages.percentageLimit[3].upperLimit = 190;
+  waterLevelPercentages.percentageLimit[3].lowerLimit = 180;
+  waterLevelPercentages.percentageLimit[2].upperLimit = 180;
+  waterLevelPercentages.percentageLimit[2].lowerLimit = 150;
+  waterLevelPercentages.percentageLimit[1].upperLimit = 150;
+  waterLevelPercentages.percentageLimit[1].lowerLimit = 120;
 }
 
 void createLCDCustomCharacters(void) {
@@ -522,6 +583,7 @@ void createLCDCustomCharacters(void) {
   lcd.createChar(WATER_LEVEL_75.id, WATER_LEVEL_75.icon);
   lcd.createChar(WATER_LEVEL_100.id, WATER_LEVEL_100.icon);
   lcd.createChar(WARNING.id, WARNING.icon);
+  lcd.createChar(BONSAI.id, BONSAI.icon);
 }
 
 void lcdPrintTime(void) {
@@ -605,7 +667,7 @@ void lcdPrintAvgDHT(void) {
     lcd.setCursor(0, 1);
     lcd.write(AVG.id);
     lcd.write(TERMOMETER.id);
-    lcd.print(tempStats.calculateMean(), 1);
+//    lcd.print(tempStats.calculateMean(), 1);
     lcd.print(F(" ºC"));
     dhtValues.hasTempChanged = false;
   }
@@ -614,7 +676,7 @@ void lcdPrintAvgDHT(void) {
     lcd.print(F(" "));
     lcd.write(AVG.id);
     lcd.write(WATER_DROP.id);
-    lcd.print(humdStats.calculateMean(), 0);
+//    lcd.print(humdStats.calculateMean(), 0);
     lcd.print(F("%"));
     dhtValues.hasHumdChanged = false;
   }
@@ -767,7 +829,7 @@ void updateWaterLevelInfo(void) {
   executionTimes.latestWaterExecution = currentTime;
 #endif
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
-  uint8_t percentageWaterValue = waterValue.normalizeValue(currentWaterValue);
+  uint8_t percentageWaterValue = normalizeValue(currentWaterValue);
   if (percentageWaterValue != waterLevelValues.waterValue) {
     waterLevelValues.waterValue = percentageWaterValue;
     waterLevelValues.hasWaterValueChanged = true;
@@ -962,10 +1024,56 @@ void publishWaterLevel(void) {
 }
 
 void statisticsUpdate(void) {
-  char *currentTime;
-  (dataTime.formattedTime + "/" + dataTime.formattedDate).toCharArray(currentTime, 19);
-  tempStats.add(dhtValues.latestTemperature, currentTime);
-  humdStats.add(dhtValues.latestHumidity, currentTime);
+  /*char *currentTime;
+  (dataTime.formattedTime + "/" + dataTime.formattedDate).toCharArray(currentTime, 19);*/
+  uint16_t temp_n = statistics.tempCurrentElement;
+  uint16_t humd_n = statistics.humdCurrentElement;
+  statistics.tempStats[temp_n].element = dhtValues.latestTemperature;
+  statistics.tempStats[temp_n].initialized = true;
+  statistics.humdStats[humd_n].element = dhtValues.latestHumidity;
+  statistics.humdStats[humd_n].initialized = true;
+
+  statistics.tempCurrentElement = ((temp_n + 1) % MAX_STATS);
+  statistics.humdCurrentElement = ((humd_n + 1) % MAX_STATS);
+//  tempStats.add(dhtValues.latestTemperature, currentTime);
+//  humdStats.add(dhtValues.latestHumidity, currentTime);
+}
+
+float getTempMean(void) {
+  uint32_t elements = 0;
+  float sum = 0.0;
+  for (uint32_t i = (MAX_STATS) - 1; i >= 0; --i) {
+    if (statistics.tempStats[i].initialized) {
+      sum += statistics.tempStats[i].element;
+      ++elements;
+    }
+  }
+  return (elements == 0) ? dhtValues.latestTemperature : (sum / elements);
+}
+
+float getHumdMean(void) {
+  uint32_t elements = 0;
+  float sum = 0.0;
+  for (uint32_t i = (MAX_STATS) - 1; i >= 0; --i) {
+    if (statistics.humdStats[i].initialized) {
+      sum += statistics.humdStats[i].element;
+      ++elements;
+    }
+  }
+  return (elements == 0) ? dhtValues.latestHumidity : (sum / elements);
+}
+
+uint8_t normalizeValue(uint16_t analogValue) {
+  if (analogValue >= UPPER_LIMIT)
+    return 100;
+  else if (analogValue <= LOWER_LIMIT)
+    return 0;
+  uint8_t i = 9;
+  for ( ; i >= 1; --i) {
+    if ((analogValue >= waterLevelPercentages.percentageLimit[i].lowerLimit) && (analogValue < waterLevelPercentages.percentageLimit[i].upperLimit))
+      break;
+  }
+  return (i * 10);
 }
 
 #if OTA_ENABLED
