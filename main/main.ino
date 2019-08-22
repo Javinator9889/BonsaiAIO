@@ -13,9 +13,9 @@
 #include <AutoConnect.h>
 
 // Components specific libraries
-#include <LiquidCrystal.h>
+#include <LiquidCrystal595.h>
 #include <Wire.h>
-#include <Adafruit_Sensor.h>
+//#include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
 
@@ -30,7 +30,7 @@
 #include <ThingSpeak.h>
 
 // ESP8266 pinout
-#include "PinConstants.h"
+//#include "PinConstants.h"
 
 // Statistics library
 //#include "Statistics.h"
@@ -72,15 +72,15 @@
 #if OTA_ENABLED
 #define OTA_URL           "http://ota.javinator9889.com"
 #define OTA_PORT          80
-#define OTA_PATH          "/esp8266/update/arduino.php"
-#define RUNNING_VERSION   "0.9b-bonsaiaio"
+#define OTA_PATH          "/"
+#define RUNNING_VERSION   "bonsaiaio"
 #endif
 
 #define TIMEZONE_DB_MAX 114
 #define EXTREME_IP_MAX  34
 
 // Other "define" constants
-#define NTP_SERVER  "0.europe.pool.ntp.org"
+#define NTP_SERVER  "pool.ntp.org"
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
 #define CLEAR_ROW   "                "
@@ -91,13 +91,6 @@
 ESP8266WebServer  Server;
 AutoConnect       Portal(Server);
 AutoConnectConfig config;
-
-// Statistics object
-//Statistics tempStats(MAX_STATS);
-//Statistics humdStats(MAX_STATS);
-
-// WaterValue object
-//WaterValues waterValue(250, 120);
 
 // Time components
 WiFiUDP ntpUDP;
@@ -111,31 +104,23 @@ struct {
   Thread tempTask;
   Thread humdTask;
   Thread wlvlTask;
-} tasks = {Thread(), Thread(), Thread(), Thread(), Thread(), Thread()};
+  Thread displayTask;
+} tasks = {Thread(), Thread(), Thread(), Thread(), Thread(), Thread(), Thread()};
 
 // Components pins
 const struct {
-  uint8_t rs;
-  uint8_t e;
+  uint8_t data;
+  uint8_t latch;
+  uint8_t clk;
+} LCD_PINS = {D6, D7, D8};
 
-  uint8_t d4;
-  uint8_t d5;
-  uint8_t d6;
-  uint8_t d7;
-} LCD_PINS = {D7, D6, D5, D4, D3, D2};
-
-const uint8_t BUTTON_PIN = D9;
+const uint8_t LED_PIN = D4;
 const uint8_t WATER_LEVEL_DATA_PIN = A0;
 const uint8_t COLUMNS = 16;
 const uint8_t ROWS = 2;
 
 // Init components
-LiquidCrystal lcd(LCD_PINS.rs,
-                  LCD_PINS.e,
-                  LCD_PINS.d4,
-                  LCD_PINS.d5,
-                  LCD_PINS.d6,
-                  LCD_PINS.d7);
+LiquidCrystal595 lcd(LCD_PINS.data, LCD_PINS.latch, LCD_PINS.clk);
 DHT_Unified dht(DHT_PIN, DHT_TYPE);
 
 // Global variables needed in hole project
@@ -161,6 +146,7 @@ volatile struct {
   uint32_t humdTaskSeconds;
   uint32_t wlvlTaskSeconds;
   uint32_t statisticsTaskSeconds;
+  uint16_t displayTaskSeconds;
 } waitingTimes = {
   18,       // 18 seconds
   9000,     // 09 seconds
@@ -170,7 +156,8 @@ volatile struct {
   300,      // 05 minutes
   300,      // 05 minutes
   1800,     // 30 minutes
-  170       // 02 minutes 50 secs
+  170,      // 02 minutes 50 secs
+  10        // 10 seconds
 };
 
 struct {
@@ -183,6 +170,7 @@ struct {
   Ticker humdTask;
   Ticker wlvlTask;
   Ticker updateStatistics;
+  Ticker displayTask;
 #if OTA_ENABLED
   SimpleTimer ota;
 #endif
@@ -283,7 +271,7 @@ void lcdPrintWiFiInformation(void);
 void rootPage(void);
 String generateRandomString(void);
 bool printLCDCaptivePortalInformation(IPAddress ip);
-ICACHE_RAM_ATTR void changeDisplayMode(void);
+void changeDisplayMode(void);
 void launchClockThread(void);
 void updateTime(void);
 void updateDHTInfo(void);
@@ -297,6 +285,7 @@ void launchWiFiMQTTTask(void);
 void launchTempMQTTTask(void);
 void launchHumdMQTTTask(void);
 void launchWLvlMQTTTask(void);
+void launchDisplayTask(void);
 void publishWiFiStrength(void);
 void publishTemperature(void);
 void publishHumidity(void);
@@ -330,15 +319,20 @@ void setup(void) {
 
   // Init components
   lcd.begin(COLUMNS, ROWS);
+  lcd.clear();
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
   initDHT();
   initWaterValuesPercentages();
-//  createLCDCustomCharacters();
+  createLCDCustomCharacters();
 
-  /*lcd.home();
+  lcd.home();
   lcd.print(F("   "));
   lcd.write(BONSAI.id);
-  lcd.print("BonsaiAIO");*/
+  lcd.print("BonsaiAIO");
   delay(2000);
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
 
   password = generateRandomString();
   initAutoConnect(password);
@@ -361,6 +355,7 @@ void setup(void) {
     lcd.setCursor(0, 1);
     lcd.print("IP: ");
     lcd.print(WiFi.localIP().toString());
+    delay(5000);
   } else {
 #if DEVMODE
     Serial.println(F("Error connecting to Internet"));
@@ -399,7 +394,7 @@ void setup(void) {
   ThingSpeak.begin(mqtt.client);
 
   // Register button interruption
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), changeDisplayMode, CHANGE);
+  /*attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), changeDisplayMode, CHANGE);*/
 
   // Setup timers
   tasks.clockThread.onRun(updateTime);
@@ -414,6 +409,8 @@ void setup(void) {
   tasks.humdTask.setInterval(waitingTimes.humdTaskSeconds * 1000);
   tasks.wlvlTask.onRun(publishWaterLevel);
   tasks.wlvlTask.setInterval(waitingTimes.wlvlTaskSeconds * 1000);
+  tasks.displayTask.onRun(changeDisplayMode);
+  tasks.displayTask.setInterval(waitingTimes.displayTaskSeconds * 1000);
 
 #if OTA_ENABLED
   timers.ota.setInterval(5000, lookForOTAUpdates);
@@ -427,11 +424,14 @@ void setup(void) {
   timers.humdTask.attach(waitingTimes.humdTaskSeconds, launchHumdMQTTTask);
   timers.wlvlTask.attach(waitingTimes.wlvlTaskSeconds, launchWLvlMQTTTask);
   timers.updateStatistics.attach(waitingTimes.statisticsTaskSeconds, statisticsUpdate);
+  timers.displayTask.attach(waitingTimes.displayTaskSeconds, launchDisplayTask);
 
   updateDHTInfo();
   updateWaterLevelInfo();
   updateTime();
   statisticsUpdate();
+
+  digitalWrite(LED_PIN, LOW);
 
 #if DEVMODE
   setupFinishedTime = millis();
@@ -443,23 +443,23 @@ void loop(void) {
   if (dataTime.hasDateChanged) {
     Serial.print(F("Date: "));
     Serial.println(dataTime.formattedDate);
-    dataTime.hasDateChanged = false;
+//    dataTime.hasDateChanged = false;
     delay(10);
   }
   if (dataTime.hasTimeChanged) {
     Serial.print(F("Time: "));
     Serial.println(dataTime.formattedTime);
-    dataTime.hasTimeChanged = false;
+//    dataTime.hasTimeChanged = false;
     delay(10);
   }
   if (dhtValues.hasTempChanged) {
     Serial.print(F("Temp: ")); Serial.println(String(dhtValues.latestTemperature) + " ºC");
-    dhtValues.hasTempChanged = false;
+//    dhtValues.hasTempChanged = false;
     delay(10);
   }
   if (dhtValues.hasHumdChanged) {
     Serial.print(F("Humd: ")); Serial.println(String(dhtValues.latestHumidity) + " %");
-    dhtValues.hasHumdChanged = false;
+//    dhtValues.hasHumdChanged = false;
     delay(10);
   }
   if (waterLevelValues.hasWaterValueChanged) {
@@ -537,20 +537,6 @@ void initDHT(void) {
 }
 
 void initWaterValuesPercentages(void) {
-//  uint8_t initialValue = 250;
-  /*for (uint8_t percentage = 90; percentage >= 10; (percentage - 10)) {
-    waterValue.setPercentageLimit(percentage, initialValue, (initialValue - 10));
-    initialValue -= 10;
-  }*/
-  /*waterValue.setPercentageLimit(90, 250, 240);
-  waterValue.setPercentageLimit(80, 240, 230);
-  waterValue.setPercentageLimit(70, 230, 220);
-  waterValue.setPercentageLimit(60, 220, 210);
-  waterValue.setPercentageLimit(50, 210, 200);
-  waterValue.setPercentageLimit(40, 200, 190);
-  waterValue.setPercentageLimit(30, 190, 180);
-  waterValue.setPercentageLimit(20, 180, 150);
-  waterValue.setPercentageLimit(10, 150, 120);*/
   waterLevelPercentages.percentageLimit[9].upperLimit = 250;
   waterLevelPercentages.percentageLimit[9].lowerLimit = 240;
   waterLevelPercentages.percentageLimit[8].upperLimit = 240;
@@ -574,15 +560,15 @@ void initWaterValuesPercentages(void) {
 void createLCDCustomCharacters(void) {
   lcd.createChar(WATER_DROP.id, WATER_DROP.icon);
   lcd.createChar(TERMOMETER.id, TERMOMETER.icon);
-  lcd.createChar(AVG.id, AVG.icon);
+//  lcd.createChar(AVG.id, AVG.icon);
   lcd.createChar(WIFI.id, WIFI.icon);
   lcd.createChar(KEY.id, KEY.icon);
   lcd.createChar(WATER_LEVEL_EMPTY.id, WATER_LEVEL_EMPTY.icon);
   lcd.createChar(WATER_LEVEL_25.id, WATER_LEVEL_25.icon);
-  lcd.createChar(WATER_LEVEL_50.id, WATER_LEVEL_50.icon);
+//  lcd.createChar(WATER_LEVEL_50.id, WATER_LEVEL_50.icon);
   lcd.createChar(WATER_LEVEL_75.id, WATER_LEVEL_75.icon);
-  lcd.createChar(WATER_LEVEL_100.id, WATER_LEVEL_100.icon);
-  lcd.createChar(WARNING.id, WARNING.icon);
+//  lcd.createChar(WATER_LEVEL_100.id, WATER_LEVEL_100.icon);
+//  lcd.createChar(WARNING.id, WARNING.icon);
   lcd.createChar(BONSAI.id, BONSAI.icon);
 }
 
@@ -626,22 +612,18 @@ void lcdPrintWaterLevel(void) {
     lcd.setCursor(0, 1);
     lcd.print(CLEAR_ROW);
     if (waterLevelValues.waterValue < 25) {
+      digitalWrite(LED_PIN, HIGH);
       lcd.setCursor(4, 1);
-      lcd.write(WARNING.id);
-      lcd.print(F(" "));
+      lcd.print(F("! "));
       lcd.write(WATER_LEVEL_EMPTY.id);
     } else if ((waterLevelValues.waterValue >= 25) && (waterLevelValues.waterValue < 50)) {
+      digitalWrite(LED_PIN, LOW);
       lcd.setCursor(6, 1);
       lcd.write(WATER_LEVEL_25.id);
-    } else if ((waterLevelValues.waterValue >= 50) && (waterLevelValues.waterValue < 75)) {
-      lcd.setCursor(6, 1);
-      lcd.write(WATER_LEVEL_50.id);
-    } else if (waterLevelValues.waterValue >= 75 && (waterLevelValues.waterValue < 90)) {
+    } else {
+      digitalWrite(LED_PIN, LOW);
       lcd.setCursor(6, 1);
       lcd.write(WATER_LEVEL_75.id);
-    } else if (waterLevelValues.waterValue >= 90) {
-      lcd.setCursor(6, 1);
-      lcd.write(WATER_LEVEL_100.id);
     }
     lcd.print(F(" "));
     lcd.print(waterLevelValues.waterValue);
@@ -665,18 +647,17 @@ void lcdPrintDate(void) {
 void lcdPrintAvgDHT(void) {
   if (dhtValues.hasTempChanged || displayModeChanged) {
     lcd.setCursor(0, 1);
-    lcd.write(AVG.id);
+    lcd.print(F("~"));
     lcd.write(TERMOMETER.id);
-//    lcd.print(tempStats.calculateMean(), 1);
+    lcd.print(getTempMean(), 1);
     lcd.print(F(" ºC"));
     dhtValues.hasTempChanged = false;
   }
   if (dhtValues.hasHumdChanged || displayModeChanged) {
     lcd.setCursor(9, 1);
-    lcd.print(F(" "));
-    lcd.write(AVG.id);
+    lcd.print(F(" ~"));
     lcd.write(WATER_DROP.id);
-//    lcd.print(humdStats.calculateMean(), 0);
+    lcd.print(getHumdMean(), 0);
     lcd.print(F("%"));
     dhtValues.hasHumdChanged = false;
   }
@@ -716,6 +697,7 @@ String generateRandomString(void) {
 
 bool printLCDCaptivePortalInformation(IPAddress ip) {
   if ((!setupExecuted) || (displayMode == WIFI_INFORMATION)) {
+    lcd.clear();
     lcd.home();
     lcd.write(WIFI.id);
     lcd.setCursor(2, 0);
@@ -950,6 +932,10 @@ void launchWLvlMQTTTask(void) {
   tasks.wlvlTask.run();
 }
 
+void launchDisplayTask(void) {
+  tasks.displayTask.run();
+}
+
 void publishWiFiStrength(void) {
   long rssi = 0;
   if (WiFi.status() == WL_CONNECTED) {
@@ -1024,8 +1010,6 @@ void publishWaterLevel(void) {
 }
 
 void statisticsUpdate(void) {
-  /*char *currentTime;
-  (dataTime.formattedTime + "/" + dataTime.formattedDate).toCharArray(currentTime, 19);*/
   uint16_t temp_n = statistics.tempCurrentElement;
   uint16_t humd_n = statistics.humdCurrentElement;
   statistics.tempStats[temp_n].element = dhtValues.latestTemperature;
@@ -1035,8 +1019,6 @@ void statisticsUpdate(void) {
 
   statistics.tempCurrentElement = ((temp_n + 1) % MAX_STATS);
   statistics.humdCurrentElement = ((humd_n + 1) % MAX_STATS);
-//  tempStats.add(dhtValues.latestTemperature, currentTime);
-//  humdStats.add(dhtValues.latestHumidity, currentTime);
 }
 
 float getTempMean(void) {
@@ -1084,7 +1066,7 @@ void lookForOTAUpdates(void) {
     Serial.println(F("Looking for OTAs..."));
     ESPhttpUpdate.setLedPin(LED_BUILTIN, LOW);
 #endif
-    t_httpUpdate_return returnValue = ESPhttpUpdate.update(OTA_URL, OTA_PORT, OTA_PATH, RUNNING_VERSION);
+    t_httpUpdate_return returnValue = ESPhttpUpdate.update(client, OTA_URL, OTA_PORT, OTA_PATH, RUNNING_VERSION);
 
     switch (returnValue) {
       case HTTP_UPDATE_FAILED:
