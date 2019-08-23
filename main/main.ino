@@ -50,12 +50,16 @@
 // Define whether the DEVMODE is active
 // for saving sketch size - set to 0 for
 // disabling
-#define DEVMODE     1
+#define DEVMODE     0
 // VVV - extra verbosity
 #define VVV         0
 // Enable or disable OTAs - disabled due to space
 // restrictions
 #define OTA_ENABLED 0
+
+#if DEVMODE
+#define PRINT_DEBUG_MESSAGES
+#endif
 
 #if OTA_ENABLED
 #include <ESP8266httpUpdate.h>
@@ -114,7 +118,9 @@ const struct {
   uint8_t clk;
 } LCD_PINS = {D6, D7, D8};
 
-const uint8_t LED_PIN = D4;
+const uint8_t LED_PIN = D0;
+//const uint8_t CONTRAST_PIN = D5;
+//const uint8_t CONTRAST_VAL = 100;
 const uint8_t WATER_LEVEL_DATA_PIN = A0;
 const uint8_t COLUMNS = 16;
 const uint8_t ROWS = 2;
@@ -153,8 +159,8 @@ volatile struct {
   1,        // 01 second
   1800 ,    // 30 minutes
   600,      // 10 minutes
-  300,      // 05 minutes
-  300,      // 05 minutes
+  60,      // 05 minutes
+  60,      // 05 minutes
   1800,     // 30 minutes
   170,      // 02 minutes 50 secs
   10        // 10 seconds
@@ -205,22 +211,26 @@ struct {
 
 // MQTT information
 struct {
-  const struct {
-    uint8_t wifiStrength;
-    uint8_t temperature;
-    uint8_t humidity;
-    uint8_t waterLevel;
+  struct {
+    unsigned int wifiStrength;
+    unsigned int temperature;
+    unsigned int humidity;
+    unsigned int waterLevel;
   } fields;
-  WiFiClient client;
-  uint32_t channelId;
+  unsigned long channelId;
   const char *apiKey;
-} mqtt = {{1, 2, 3, 4}, WiFiClient(), CHANNEL_ID, THINGSPEAK_API};
+} mqtt = {{1, 2, 3, 4}, CHANNEL_ID, THINGSPEAK_API};
 
 // Custom types definition
 typedef struct {
-  float element;
+  float value;
   bool initialized;
-} measure;
+} tempMeasure;
+
+typedef struct {
+  uint16_t value;
+  bool initialized;
+} humdMeasure;
 
 typedef struct {
   int16_t upperLimit;
@@ -228,11 +238,13 @@ typedef struct {
 } percentagesLimit;
 
 struct {
-  measure tempStats[MAX_STATS];
-  measure humdStats[MAX_STATS];
+  tempMeasure tempStats[MAX_STATS];
+  humdMeasure humdStats[MAX_STATS];
   uint16_t tempCurrentElement;
   uint16_t humdCurrentElement;
-} statistics = {{0, false}, {0, false}, 0, 0};
+  int16_t tempDefault;
+  int16_t humdDefault;
+} statistics = {{0, 0}, {0, 0}, 0, 0, -999, -9};
 
 struct {
   percentagesLimit percentageLimit[11];
@@ -255,6 +267,9 @@ bool setupExecuted = false;
 bool displayModeChanged = false;
 String password;
 volatile bool hasDisplayModeBeenPrinted[N_DISPLAY_MODES] = {false};
+String latestSSID = "";
+long latestRSSI = 0;
+WiFiClient client;
 
 // Define the functions that will be
 // available
@@ -315,9 +330,28 @@ void setup(void) {
     continue;
   }
   Serial.println(F("Serial initialized"));
+  /*for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
+    Serial.printf("Evaluating element #%i with values: %.1f(%d) | %d(%d)\n", 
+                  i, statistics.tempStats[i].value, statistics.tempStats[i].initialized,
+                  statistics.humdStats[i].value, statistics.humdStats[i].initialized);
+    delay(100);
+  }*/
 #endif
+  // Setup custom value inside stats arrays
+  for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
+    statistics.tempStats[i].initialized = false;
+    statistics.humdStats[i].initialized = false;
+  }/*
+#if DEVMODE
+  for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
+    Serial.printf("Evaluating element #%i with values: %.1f | %d\n", i, statistics.tempStats[i], statistics.humdStats[i]);
+    delay(100);
+  }
+#endif*/
 
   // Init components
+  /*pinMode(CONTRAST_PIN, OUTPUT);
+  analogWrite(CONTRAST_PIN, CONTRAST_VAL);*/
   lcd.begin(COLUMNS, ROWS);
   lcd.clear();
   pinMode(LED_PIN, OUTPUT);
@@ -391,7 +425,7 @@ void setup(void) {
   ntp.begin();
 
   // Init ThingSpeak as we have network
-  ThingSpeak.begin(mqtt.client);
+  ThingSpeak.begin(client);
 
   // Register button interruption
   /*attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), changeDisplayMode, CHANGE);*/
@@ -424,7 +458,7 @@ void setup(void) {
   timers.humdTask.attach(waitingTimes.humdTaskSeconds, launchHumdMQTTTask);
   timers.wlvlTask.attach(waitingTimes.wlvlTaskSeconds, launchWLvlMQTTTask);
   timers.updateStatistics.attach(waitingTimes.statisticsTaskSeconds, statisticsUpdate);
-  timers.displayTask.attach(waitingTimes.displayTaskSeconds, launchDisplayTask);
+  timers.displayTask.attach(waitingTimes.displayTaskSeconds, changeDisplayMode);
 
   updateDHTInfo();
   updateWaterLevelInfo();
@@ -439,41 +473,12 @@ void setup(void) {
 }
 
 void loop(void) {
-#if DEVMODE
-  if (dataTime.hasDateChanged) {
-    Serial.print(F("Date: "));
-    Serial.println(dataTime.formattedDate);
-//    dataTime.hasDateChanged = false;
-    delay(10);
-  }
-  if (dataTime.hasTimeChanged) {
-    Serial.print(F("Time: "));
-    Serial.println(dataTime.formattedTime);
-//    dataTime.hasTimeChanged = false;
-    delay(10);
-  }
-  if (dhtValues.hasTempChanged) {
-    Serial.print(F("Temp: ")); Serial.println(String(dhtValues.latestTemperature) + " ºC");
-//    dhtValues.hasTempChanged = false;
-    delay(10);
-  }
-  if (dhtValues.hasHumdChanged) {
-    Serial.print(F("Humd: ")); Serial.println(String(dhtValues.latestHumidity) + " %");
-//    dhtValues.hasHumdChanged = false;
-    delay(10);
-  }
-  if (waterLevelValues.hasWaterValueChanged) {
-    Serial.print(F("Water level: ")); Serial.println(String(waterLevelValues.waterValue));
-    waterLevelValues.hasWaterValueChanged = false;
-    delay(10);
-  }
-#endif
   timers.dhtSensor.run();
 #if OTA_ENABLED
   timers.ota.run();
 #endif
   Portal.handleClient();
-  switch(displayMode) {
+  switch((uint8_t) displayMode) {
     case DEFAULT_MODE:
       lcdPrintTime();
       lcdPrintDHT();
@@ -492,6 +497,7 @@ void loop(void) {
       break;
     case WIFI_INFORMATION:
       lcdPrintWiFiInformation();
+      break;
     default:
       displayMode = DEFAULT_MODE;
       break;
@@ -560,20 +566,21 @@ void initWaterValuesPercentages(void) {
 void createLCDCustomCharacters(void) {
   lcd.createChar(WATER_DROP.id, WATER_DROP.icon);
   lcd.createChar(TERMOMETER.id, TERMOMETER.icon);
-//  lcd.createChar(AVG.id, AVG.icon);
   lcd.createChar(WIFI.id, WIFI.icon);
   lcd.createChar(KEY.id, KEY.icon);
   lcd.createChar(WATER_LEVEL_EMPTY.id, WATER_LEVEL_EMPTY.icon);
   lcd.createChar(WATER_LEVEL_25.id, WATER_LEVEL_25.icon);
-//  lcd.createChar(WATER_LEVEL_50.id, WATER_LEVEL_50.icon);
   lcd.createChar(WATER_LEVEL_75.id, WATER_LEVEL_75.icon);
-//  lcd.createChar(WATER_LEVEL_100.id, WATER_LEVEL_100.icon);
-//  lcd.createChar(WARNING.id, WARNING.icon);
   lcd.createChar(BONSAI.id, BONSAI.icon);
 }
 
 void lcdPrintTime(void) {
   if (dataTime.hasTimeChanged || displayModeChanged) {
+#if DEVMODE
+    Serial.print(F("Time: "));
+    Serial.println(dataTime.formattedTime);
+    delay(10);
+#endif
     lcd.home();
     lcd.print(CLEAR_ROW);
     lcd.home();
@@ -581,21 +588,28 @@ void lcdPrintTime(void) {
     lcd.print(dataTime.formattedTime);
     lcd.print(F("    "));
     dataTime.hasTimeChanged = false;
-    if (displayModeChanged)
-      displayModeChanged = false;
+    /*if (displayModeChanged)
+      displayModeChanged = false;*/
   }
 }
 
 void lcdPrintDHT(void) {
-  if (dhtValues.hasTempChanged || displayModeChanged) {
+  if (dhtValues.hasTempChanged || displayModeChanged || dhtValues.hasHumdChanged) {
+#if DEVMODE
+    Serial.print(F("Temp: ")); Serial.println(String(dhtValues.latestTemperature) + " ºC");
+    Serial.print(F("Humd: ")); Serial.println(String(dhtValues.latestHumidity) + " %");
+    delay(10);
+#endif
+    lcd.setCursor(0, 1);
+    lcd.print(CLEAR_ROW);
     lcd.setCursor(0, 1);
     lcd.print(F(" "));
     lcd.write(TERMOMETER.id);
     lcd.print(dhtValues.latestTemperature, 1);
-    lcd.print(F(" ºC"));
+    lcd.print(F(" "));
+    lcd.print((char)223);
+    lcd.print(F("C"));
     dhtValues.hasTempChanged = false;
-  }
-  if (dhtValues.hasHumdChanged || displayModeChanged) {
     lcd.setCursor(9, 1);
     lcd.print(F("  "));
     lcd.write(WATER_DROP.id);
@@ -609,6 +623,11 @@ void lcdPrintDHT(void) {
 
 void lcdPrintWaterLevel(void) {
   if (waterLevelValues.hasWaterValueChanged || displayModeChanged) {
+#if DEVMODE
+    Serial.print(F("Water level: ")); Serial.println(String(waterLevelValues.waterValue));
+    waterLevelValues.hasWaterValueChanged = false;
+    delay(10);
+#endif
     lcd.setCursor(0, 1);
     lcd.print(CLEAR_ROW);
     if (waterLevelValues.waterValue < 25) {
@@ -635,6 +654,11 @@ void lcdPrintWaterLevel(void) {
 
 void lcdPrintDate(void) {
   if (dataTime.hasDateChanged || displayModeChanged) {
+#if DEVMODE
+    Serial.print(F("Date: "));
+    Serial.println(dataTime.formattedDate);
+    delay(10);
+#endif
     lcd.setCursor(0, 1);
     lcd.print(CLEAR_ROW);
     lcd.setCursor(3, 1);
@@ -647,15 +671,17 @@ void lcdPrintDate(void) {
 void lcdPrintAvgDHT(void) {
   if (dhtValues.hasTempChanged || displayModeChanged) {
     lcd.setCursor(0, 1);
-    lcd.print(F("~"));
+    lcd.print(F(" /"));
     lcd.write(TERMOMETER.id);
     lcd.print(getTempMean(), 1);
-    lcd.print(F(" ºC"));
+    lcd.print(F(" "));
+    lcd.print((char)223);
+    lcd.print(F("C"));
     dhtValues.hasTempChanged = false;
   }
   if (dhtValues.hasHumdChanged || displayModeChanged) {
     lcd.setCursor(9, 1);
-    lcd.print(F(" ~"));
+    lcd.print(F(" /"));
     lcd.write(WATER_DROP.id);
     lcd.print(getHumdMean(), 0);
     lcd.print(F("%"));
@@ -667,20 +693,28 @@ void lcdPrintAvgDHT(void) {
 
 void lcdPrintWiFiInformation(void) {
   if (WiFi.status() == WL_CONNECTED) {
-    lcd.clear();
-    lcd.print(WiFi.SSID().c_str());
-    lcd.setCursor(0, 1);
-    lcd.write(WIFI.id);
-    lcd.print(F(" "));
-    lcd.print(WiFi.RSSI());
-    lcd.print(F(" dBm"));
+    long rssi = WiFi.RSSI();
+    String ssid = WiFi.SSID();
+    if (displayModeChanged || (rssi != latestRSSI) || (ssid != latestSSID)) {
+      lcd.clear();
+      lcd.print(ssid.c_str());
+      lcd.setCursor(0, 1);
+      lcd.write(WIFI.id);
+      lcd.print(F(" "));
+      lcd.print(rssi);
+      lcd.print(F(" dBm"));
+      latestRSSI = rssi;
+      latestSSID = ssid;
+      if (displayModeChanged)
+        displayModeChanged = false;
+    }
   } else {
     printLCDCaptivePortalInformation(IPAddress(255, 255, 255, 255));
   }
 }
 
 void rootPage(void) {
-  char content[] = "Hello, world";
+  char content[] = "<a href=\"/_ac\">Click here to go to configuration</a>";
   Server.send(200, "text/plain", content);
 }
 
@@ -713,6 +747,9 @@ bool printLCDCaptivePortalInformation(IPAddress ip) {
 void changeDisplayMode(void) {
   displayMode = (displayMode + 1) % N_DISPLAY_MODES;
   displayModeChanged = true;
+#if DEVMODE
+  Serial.printf("Changing display mode: %d\n", displayMode);
+#endif
 }
 
 void launchClockThread(void) {
@@ -942,10 +979,11 @@ void publishWiFiStrength(void) {
     rssi = WiFi.RSSI();
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.wifiStrength, rssi, mqtt.apiKey);
 #if DEVMODE
+  Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, rssi, mqtt.apiKey);
     if (httpCode == 200) {
       Serial.println("Correctly published WiFi Strength");
     } else {
-      Serial.printf("Problem publishing WiFi Strength - error code: %i", httpCode);
+      Serial.printf("Problem publishing WiFi Strength - error code: %i\n", httpCode);
     }
 #endif
   } else {
@@ -960,10 +998,11 @@ void publishTemperature(void) {
 
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, dhtValues.latestTemperature, mqtt.apiKey);
 #if DEVMODE
+    Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, dhtValues.latestTemperature, mqtt.apiKey);
     if (httpCode == 200) {
       Serial.println("Correctly published Temperature");
     } else {
-      Serial.printf("Problem publishing Temperature - error code: %i", httpCode);
+      Serial.printf("Problem publishing Temperature - error code: %i\n", httpCode);
     }
 #endif
   } else {
@@ -978,8 +1017,9 @@ void publishHumidity(void) {
 
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.humidity, dhtValues.latestHumidity, mqtt.apiKey);
 #if DEVMODE
+    Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, dhtValues.latestHumidity, mqtt.apiKey);
     if (httpCode == 200) {
-      Serial.println("Correctly published Humidity");
+      Serial.println("Correctly published Humidity\n");
     } else {
       Serial.printf("Problem publishing Humidity - error code: %i", httpCode);
     }
@@ -996,10 +1036,11 @@ void publishWaterLevel(void) {
 
     int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, waterLevelValues.waterValue, mqtt.apiKey);
 #if DEVMODE
+    Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, waterLevelValues.waterValue, mqtt.apiKey);
     if (httpCode == 200) {
       Serial.println("Correctly published Water Value");
     } else {
-      Serial.printf("Problem publishing Water Value - error code: %i", httpCode);
+      Serial.printf("Problem publishing Water Value - error code: %i\n", httpCode);
     }
 #endif
   } else {
@@ -1010,11 +1051,19 @@ void publishWaterLevel(void) {
 }
 
 void statisticsUpdate(void) {
+#if DEVMODE
+  Serial.println("Updating statistics");
+  Serial.printf("Latest temperature: %f | Latest humidity: %d\n", 
+                dhtValues.latestTemperature, dhtValues.latestHumidity);  
+#endif
   uint16_t temp_n = statistics.tempCurrentElement;
   uint16_t humd_n = statistics.humdCurrentElement;
-  statistics.tempStats[temp_n].element = dhtValues.latestTemperature;
+#if DEVMODE
+  Serial.printf("Saving values to field #%i|%i\n", temp_n, humd_n);
+#endif
+  statistics.tempStats[temp_n].value = dhtValues.latestTemperature;
   statistics.tempStats[temp_n].initialized = true;
-  statistics.humdStats[humd_n].element = dhtValues.latestHumidity;
+  statistics.humdStats[humd_n].value = dhtValues.latestHumidity;
   statistics.humdStats[humd_n].initialized = true;
 
   statistics.tempCurrentElement = ((temp_n + 1) % MAX_STATS);
@@ -1022,26 +1071,54 @@ void statisticsUpdate(void) {
 }
 
 float getTempMean(void) {
+#if DEVMODE
+  Serial.println("Calculating temp mean...");
+#endif
   uint32_t elements = 0;
-  float sum = 0.0;
-  for (uint32_t i = (MAX_STATS) - 1; i >= 0; --i) {
-    if (statistics.tempStats[i].initialized) {
-      sum += statistics.tempStats[i].element;
+  double sum = 0.0;
+  tempMeasure element;
+  for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
+    element = statistics.tempStats[i];
+    if (element.initialized == true) {
+      sum += element.value;
       ++elements;
+#if DEVMODE
+      Serial.printf("Current sum: %f - elements found: %i\n", sum, elements);
+      delay(10);
+#endif
+    } else {
+      break;
     }
   }
+#if DEVMODE
+  Serial.printf("Temperature mean: %.2f (elements: %i)\n", (elements == 0) ? dhtValues.latestTemperature : (sum / elements), elements);
+#endif
   return (elements == 0) ? dhtValues.latestTemperature : (sum / elements);
 }
 
 float getHumdMean(void) {
+#if DEVMODE
+  Serial.println("Calculating humd mean...");
+#endif
   uint32_t elements = 0;
-  float sum = 0.0;
+  uint64_t sum = 0;
+  humdMeasure element;
   for (uint32_t i = (MAX_STATS) - 1; i >= 0; --i) {
-    if (statistics.humdStats[i].initialized) {
-      sum += statistics.humdStats[i].element;
+    element = statistics.humdStats[i];
+    if (element.initialized == true) {
+      sum += element.value;
       ++elements;
+#if DEVMODE
+      Serial.printf("Current sum: %f - elements found: %i\n", sum, elements);
+      delay(10);
+#endif
+    } else {
+      break;
     }
   }
+#if DEVMODE
+  Serial.printf("Humidity mean: %.2f (elements: %i)\n", (elements == 0) ? dhtValues.latestHumidity : (sum / elements), elements);
+#endif
   return (elements == 0) ? dhtValues.latestHumidity : (sum / elements);
 }
 
