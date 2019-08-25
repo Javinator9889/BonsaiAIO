@@ -8,6 +8,7 @@
 // Web control & WiFi libraries
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
@@ -29,20 +30,20 @@
 #include <Thread.h>
 #include <ThingSpeak.h>
 
+// ThingSpeak publisher class
+#include "ThingSpeakPublisher.h"
+
 // ESP8266 pinout
 //#include "PinConstants.h"
 
 // Statistics library
-//#include "Statistics.h"
+#include "SensorStats.h"
 
 // Custom display modes
 #include "DisplayModes.h"
 
 // API Keys
 #include "ApiKeys.h"
-
-// Water value calculator
-//#include "WaterValues.h"
 
 // LCD Icons
 #include "LCDIcons.h"
@@ -55,7 +56,7 @@
 #define VVV         0
 // Enable or disable OTAs - disabled due to space
 // restrictions
-#define OTA_ENABLED 0
+#define OTA_ENABLED 1
 
 #if DEVMODE
 #define PRINT_DEBUG_MESSAGES
@@ -65,19 +66,14 @@
 #include <ESP8266httpUpdate.h>
 #endif
 
-// Maximum stats we will keep in memory
-#define MAX_STATS   512
-
 // Strings & URLs that will be used
 #define TIMEZONE_DB_URL   "http://api.timezonedb.com/v2.1/get-time-zone?key=%s&format=json&by=position&lat=%s&lng=%s"
 #define EXTREME_IP_URL    "http://extreme-ip-lookup.com/json/"
 
 // OTA static constant values
 #if OTA_ENABLED
-#define OTA_URL           "http://ota.javinator9889.com"
-#define OTA_PORT          80
-#define OTA_PATH          "/"
-#define RUNNING_VERSION   "bonsaiaio"
+#define OTA_URL           "http://ota.javinator9889.com/"
+#define RUNNING_VERSION   "bonsaiaio.bin"
 #endif
 
 #define TIMEZONE_DB_MAX 114
@@ -87,11 +83,14 @@
 #define NTP_SERVER  "pool.ntp.org"
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
+// As the setup is inside a box, we have to "fix" the temperature (about 2 ºC degrees)
+#define TEMPERATURE_FIX -2.7
 #define CLEAR_ROW   "                "
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
 
 // Web control objects
+WiFiClient client;
 ESP8266WebServer  Server;
 AutoConnect       Portal(Server);
 AutoConnectConfig config;
@@ -102,14 +101,9 @@ NTPClient ntp(ntpUDP, NTP_SERVER);
 
 // Threads
 struct {
-  Thread clockThread;
   Thread offsetTask;
-  Thread wifiTask;
-  Thread tempTask;
-  Thread humdTask;
-  Thread wlvlTask;
   Thread displayTask;
-} tasks = {Thread(), Thread(), Thread(), Thread(), Thread(), Thread(), Thread()};
+} tasks = {Thread(), Thread()};
 
 // Components pins
 const struct {
@@ -119,8 +113,6 @@ const struct {
 } LCD_PINS = {D6, D7, D8};
 
 const uint8_t LED_PIN = D0;
-//const uint8_t CONTRAST_PIN = D5;
-//const uint8_t CONTRAST_VAL = 100;
 const uint8_t WATER_LEVEL_DATA_PIN = A0;
 const uint8_t COLUMNS = 16;
 const uint8_t ROWS = 2;
@@ -153,30 +145,35 @@ volatile struct {
   uint32_t wlvlTaskSeconds;
   uint32_t statisticsTaskSeconds;
   uint16_t displayTaskSeconds;
+  uint16_t otaCheckMs;
+  uint32_t clearStatsSeconds;
 } waitingTimes = {
   18,       // 18 seconds
   9000,     // 09 seconds
   1,        // 01 second
   1800 ,    // 30 minutes
-  600,      // 10 minutes
-  60,      // 05 minutes
-  60,      // 05 minutes
-  1800,     // 30 minutes
-  170,      // 02 minutes 50 secs
-  10        // 10 seconds
+  615,      // 10 minutes 05 seconds
+  332,      // 05 minutes 32 seconds
+  297,      // 04 minutes 57 seconds
+  1807,     // 30 minutes 07 seconds
+  60,       // 60 seconds
+  10,       // 10 seconds
+  60000,    // 60 seconds
+  86400     // 01 day
 };
 
 struct {
   SimpleTimer dhtSensor;
+  SimpleTimer clockControl;
   Ticker waterSensor;
-  Ticker clockControl;
   Ticker offsetControl;
-  Ticker wifiTask;
-  Ticker tempTask;
-  Ticker humdTask;
-  Ticker wlvlTask;
   Ticker updateStatistics;
   Ticker displayTask;
+  Ticker clearStatsTask;
+  SimpleTimer wifiTask;
+  SimpleTimer tempTask;
+  SimpleTimer humdTask;
+  SimpleTimer wlvlTask;
 #if OTA_ENABLED
   SimpleTimer ota;
 #endif
@@ -210,41 +207,18 @@ struct {
 } geolocationInformation = {"", "", "", 0};
 
 // MQTT information
-struct {
-  struct {
-    unsigned int wifiStrength;
-    unsigned int temperature;
-    unsigned int humidity;
-    unsigned int waterLevel;
-  } fields;
-  unsigned long channelId;
-  const char *apiKey;
-} mqtt = {{1, 2, 3, 4}, CHANNEL_ID, THINGSPEAK_API};
-
-// Custom types definition
-typedef struct {
-  float value;
-  bool initialized;
-} tempMeasure;
-
-typedef struct {
-  uint16_t value;
-  bool initialized;
-} humdMeasure;
+ThingSpeakPublisher mqttWiFi(CHANNEL_ID, THINGSPEAK_API, 1, client);
+ThingSpeakPublisher mqttTemp(CHANNEL_ID, THINGSPEAK_API, 2, client);
+ThingSpeakPublisher mqttHumd(CHANNEL_ID, THINGSPEAK_API, 3, client);
+ThingSpeakPublisher mqttWlvl(CHANNEL_ID, THINGSPEAK_API, 4, client);
 
 typedef struct {
   int16_t upperLimit;
   int16_t lowerLimit;
 } percentagesLimit;
 
-struct {
-  tempMeasure tempStats[MAX_STATS];
-  humdMeasure humdStats[MAX_STATS];
-  uint16_t tempCurrentElement;
-  uint16_t humdCurrentElement;
-  int16_t tempDefault;
-  int16_t humdDefault;
-} statistics = {{0, 0}, {0, 0}, 0, 0, -999, -9};
+SensorStats tempStats;
+SensorStats humdStats;
 
 struct {
   percentagesLimit percentageLimit[11];
@@ -269,7 +243,6 @@ String password;
 volatile bool hasDisplayModeBeenPrinted[N_DISPLAY_MODES] = {false};
 String latestSSID = "";
 long latestRSSI = 0;
-WiFiClient client;
 
 // Define the functions that will be
 // available
@@ -296,10 +269,6 @@ void setupLatituteLongitude(void);
 void getTimezoneOffset(void);
 void setupClock(void);
 void launchOffsetTask(void);
-void launchWiFiMQTTTask(void);
-void launchTempMQTTTask(void);
-void launchHumdMQTTTask(void);
-void launchWLvlMQTTTask(void);
 void launchDisplayTask(void);
 void publishWiFiStrength(void);
 void publishTemperature(void);
@@ -309,6 +278,7 @@ void statisticsUpdate(void);
 float getTempMean(void);
 float getHumdMean(void);
 uint8_t normalizeValue(uint16_t analogValue);
+void clearStats(void);
 #if OTA_ENABLED
 void lookForOTAUpdates(void);
 #endif
@@ -330,28 +300,9 @@ void setup(void) {
     continue;
   }
   Serial.println(F("Serial initialized"));
-  /*for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
-    Serial.printf("Evaluating element #%i with values: %.1f(%d) | %d(%d)\n", 
-                  i, statistics.tempStats[i].value, statistics.tempStats[i].initialized,
-                  statistics.humdStats[i].value, statistics.humdStats[i].initialized);
-    delay(100);
-  }*/
 #endif
-  // Setup custom value inside stats arrays
-  for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
-    statistics.tempStats[i].initialized = false;
-    statistics.humdStats[i].initialized = false;
-  }/*
-#if DEVMODE
-  for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
-    Serial.printf("Evaluating element #%i with values: %.1f | %d\n", i, statistics.tempStats[i], statistics.humdStats[i]);
-    delay(100);
-  }
-#endif*/
 
   // Init components
-  /*pinMode(CONTRAST_PIN, OUTPUT);
-  analogWrite(CONTRAST_PIN, CONTRAST_VAL);*/
   lcd.begin(COLUMNS, ROWS);
   lcd.clear();
   pinMode(LED_PIN, OUTPUT);
@@ -404,11 +355,6 @@ void setup(void) {
 #endif
   displayMode           = DEFAULT_MODE;
 
-#if DEVMODE
-  Serial.print(F("Setup elapsed time: "));
-  Serial.println(millis());
-#endif
-
   // Setup clock data - correct timezone (offset)
   setupClock();
 #if DEVMODE
@@ -427,38 +373,26 @@ void setup(void) {
   // Init ThingSpeak as we have network
   ThingSpeak.begin(client);
 
-  // Register button interruption
-  /*attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), changeDisplayMode, CHANGE);*/
-
   // Setup timers
-  tasks.clockThread.onRun(updateTime);
-  tasks.clockThread.setInterval(waitingTimes.clockSeconds * 1000);
   tasks.offsetTask.onRun(setupClock);
   tasks.offsetTask.setInterval(waitingTimes.offsetSeconds * 1000);
-  tasks.wifiTask.onRun(publishWiFiStrength);
-  tasks.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000);
-  tasks.tempTask.onRun(publishTemperature);
-  tasks.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000);
-  tasks.humdTask.onRun(publishHumidity);
-  tasks.humdTask.setInterval(waitingTimes.humdTaskSeconds * 1000);
-  tasks.wlvlTask.onRun(publishWaterLevel);
-  tasks.wlvlTask.setInterval(waitingTimes.wlvlTaskSeconds * 1000);
   tasks.displayTask.onRun(changeDisplayMode);
   tasks.displayTask.setInterval(waitingTimes.displayTaskSeconds * 1000);
 
 #if OTA_ENABLED
-  timers.ota.setInterval(5000, lookForOTAUpdates);
+  timers.ota.setInterval(waitingTimes.otaCheckMs, lookForOTAUpdates);
 #endif
   timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
-  timers.clockControl.attach(waitingTimes.clockSeconds, launchClockThread);
+  timers.clockControl.setInterval(waitingTimes.clockSeconds * 1000, updateTime);
   timers.offsetControl.attach(waitingTimes.offsetSeconds, launchOffsetTask);
-  timers.wifiTask.attach(waitingTimes.wifiTaskSeconds, launchWiFiMQTTTask);
-  timers.tempTask.attach(waitingTimes.tempTaskSeconds, launchTempMQTTTask);
-  timers.humdTask.attach(waitingTimes.humdTaskSeconds, launchHumdMQTTTask);
-  timers.wlvlTask.attach(waitingTimes.wlvlTaskSeconds, launchWLvlMQTTTask);
+  timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
+  timers.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000, publishTemperature);
+  timers.humdTask.setInterval(waitingTimes.humdTaskSeconds * 1000, publishHumidity);
+  timers.wlvlTask.setInterval(waitingTimes.wlvlTaskSeconds * 1000, publishWaterLevel);
   timers.updateStatistics.attach(waitingTimes.statisticsTaskSeconds, statisticsUpdate);
   timers.displayTask.attach(waitingTimes.displayTaskSeconds, changeDisplayMode);
+  timers.clearStatsTask.attach(waitingTimes.clearStatsSeconds, clearStats);
 
   updateDHTInfo();
   updateWaterLevelInfo();
@@ -469,10 +403,13 @@ void setup(void) {
 
 #if DEVMODE
   setupFinishedTime = millis();
+  Serial.print(F("Setup elapsed time: "));
+  Serial.println(setupFinishedTime);
 #endif
 }
 
 void loop(void) {
+  timers.clockControl.run();
   timers.dhtSensor.run();
 #if OTA_ENABLED
   timers.ota.run();
@@ -502,13 +439,21 @@ void loop(void) {
       displayMode = DEFAULT_MODE;
       break;
   }
+  timers.wifiTask.run();
+  timers.tempTask.run();
+  timers.humdTask.run();
+  timers.wlvlTask.run();
 }
 
 
 void initAutoConnect(String password) {
   config.apid = "BonsaiAIO";
   config.psk = password;
-  config.retainPortal = true;
+  config.retainPortal = false;
+  config.hostName = "BonsaiAIO";
+  config.title = "BonsaiAIO";
+  config.dns1 = IPAddress(8, 8, 8, 8);
+  config.dns2 = IPAddress(8, 8, 4, 4);
 }
 
 void initDHT(void) {
@@ -588,8 +533,6 @@ void lcdPrintTime(void) {
     lcd.print(dataTime.formattedTime);
     lcd.print(F("    "));
     dataTime.hasTimeChanged = false;
-    /*if (displayModeChanged)
-      displayModeChanged = false;*/
   }
 }
 
@@ -649,6 +592,8 @@ void lcdPrintWaterLevel(void) {
     lcd.print(F("%"));
     if (displayModeChanged)
       displayModeChanged = false;
+    if (waterLevelValues.hasWaterValueChanged)
+      waterLevelValues.hasWaterValueChanged = false;
   }
 }
 
@@ -671,16 +616,16 @@ void lcdPrintDate(void) {
 void lcdPrintAvgDHT(void) {
   if (dhtValues.hasTempChanged || displayModeChanged) {
     lcd.setCursor(0, 1);
-    lcd.print(F(" /"));
+    lcd.print(F("/"));
     lcd.write(TERMOMETER.id);
-    lcd.print(getTempMean(), 1);
+    lcd.print(getTempMean(), 2);
     lcd.print(F(" "));
     lcd.print((char)223);
     lcd.print(F("C"));
     dhtValues.hasTempChanged = false;
   }
   if (dhtValues.hasHumdChanged || displayModeChanged) {
-    lcd.setCursor(9, 1);
+    lcd.setCursor(10, 1);
     lcd.print(F(" /"));
     lcd.write(WATER_DROP.id);
     lcd.print(getHumdMean(), 0);
@@ -709,13 +654,16 @@ void lcdPrintWiFiInformation(void) {
         displayModeChanged = false;
     }
   } else {
-    printLCDCaptivePortalInformation(IPAddress(255, 255, 255, 255));
+    Server.on("/", rootPage);
+    Portal.config(config);
+    Portal.onDetect(printLCDCaptivePortalInformation);
+    Portal.begin();
   }
 }
 
 void rootPage(void) {
   char content[] = "<a href=\"/_ac\">Click here to go to configuration</a>";
-  Server.send(200, "text/plain", content);
+  Server.send(200, "text/html", content);
 }
 
 String generateRandomString(void) {
@@ -750,10 +698,6 @@ void changeDisplayMode(void) {
 #if DEVMODE
   Serial.printf("Changing display mode: %d\n", displayMode);
 #endif
-}
-
-void launchClockThread(void) {
-  tasks.clockThread.run();
 }
 
 void updateTime(void) {
@@ -810,13 +754,14 @@ void updateDHTInfo(void) {
 #endif
   }
   else {
-#if VVV
+#if DEVMODE
     Serial.print(F("Temperature: "));
-    Serial.print(event.temperature);
+    Serial.print(event.temperature + TEMPERATURE_FIX);
     Serial.println(F("°C"));
+    Serial.printf("No fixed temp: %.2f\n", event.temperature);
 #endif
     if (event.temperature != dhtValues.latestTemperature) {
-      dhtValues.latestTemperature = event.temperature;
+      dhtValues.latestTemperature = (event.temperature + TEMPERATURE_FIX);
       dhtValues.hasTempChanged = true;
     }
   }
@@ -878,7 +823,7 @@ void setupLatituteLongitude(void) {
     Serial.print(F("EXTREME URL: "));
     Serial.println(EXTREME_IP_URL);
 #endif
-    http.begin(EXTREME_IP_URL);
+    http.begin(client, EXTREME_IP_URL);
     int httpCode = http.GET();
     if (httpCode > 0) {
       DynamicJsonDocument jsonBuffer(EXTREME_IP_BUFFER_SIZE);
@@ -916,7 +861,7 @@ void getTimezoneOffset(void) {
     Serial.print(F("TIMEZONE DB URL: "));
     Serial.println(formattedUrl);
 #endif
-    http.begin(formattedUrl);
+    http.begin(client, formattedUrl);
     int httpCode = http.GET();
     if (httpCode > 0) {
       DynamicJsonDocument jsonBuffer(TIMEZONE_DB_BUFFER_SIZE);
@@ -953,33 +898,15 @@ void launchOffsetTask(void) {
   tasks.offsetTask.run();
 }
 
-void launchWiFiMQTTTask(void) {
-  tasks.wifiTask.run();
-}
-
-void launchTempMQTTTask(void) {
-  tasks.tempTask.run();
-}
-
-void launchHumdMQTTTask(void) {
-  tasks.humdTask.run();
-}
-
-void launchWLvlMQTTTask(void) {
-  tasks.wlvlTask.run();
-}
-
 void launchDisplayTask(void) {
   tasks.displayTask.run();
 }
 
 void publishWiFiStrength(void) {
-  long rssi = 0;
   if (WiFi.status() == WL_CONNECTED) {
-    rssi = WiFi.RSSI();
-    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.wifiStrength, rssi, mqtt.apiKey);
+    long rssi = WiFi.RSSI();
+    int httpCode = mqttWiFi.publish(rssi);
 #if DEVMODE
-  Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, rssi, mqtt.apiKey);
     if (httpCode == 200) {
       Serial.println("Correctly published WiFi Strength");
     } else {
@@ -995,10 +922,8 @@ void publishWiFiStrength(void) {
 
 void publishTemperature(void) {
   if (WiFi.status() == WL_CONNECTED) {
-
-    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, dhtValues.latestTemperature, mqtt.apiKey);
+    int httpCode = mqttTemp.publish(dhtValues.latestTemperature);
 #if DEVMODE
-    Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, dhtValues.latestTemperature, mqtt.apiKey);
     if (httpCode == 200) {
       Serial.println("Correctly published Temperature");
     } else {
@@ -1014,10 +939,8 @@ void publishTemperature(void) {
 
 void publishHumidity(void) {
   if (WiFi.status() == WL_CONNECTED) {
-
-    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.humidity, dhtValues.latestHumidity, mqtt.apiKey);
+    int httpCode = mqttHumd.publish(dhtValues.latestHumidity);
 #if DEVMODE
-    Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, dhtValues.latestHumidity, mqtt.apiKey);
     if (httpCode == 200) {
       Serial.println("Correctly published Humidity\n");
     } else {
@@ -1033,10 +956,8 @@ void publishHumidity(void) {
 
 void publishWaterLevel(void) {
   if (WiFi.status() == WL_CONNECTED) {
-
-    int httpCode = ThingSpeak.writeField(mqtt.channelId, mqtt.fields.temperature, waterLevelValues.waterValue, mqtt.apiKey);
-#if DEVMODE
-    Serial.printf("Writing value to channel %i to field %i with value %.2f and api %s\n", mqtt.channelId, mqtt.fields.temperature, waterLevelValues.waterValue, mqtt.apiKey);
+    int httpCode = mqttWlvl.publish(waterLevelValues.waterValue);
+#if DEVMODE    
     if (httpCode == 200) {
       Serial.println("Correctly published Water Value");
     } else {
@@ -1056,70 +977,24 @@ void statisticsUpdate(void) {
   Serial.printf("Latest temperature: %f | Latest humidity: %d\n", 
                 dhtValues.latestTemperature, dhtValues.latestHumidity);  
 #endif
-  uint16_t temp_n = statistics.tempCurrentElement;
-  uint16_t humd_n = statistics.humdCurrentElement;
-#if DEVMODE
-  Serial.printf("Saving values to field #%i|%i\n", temp_n, humd_n);
-#endif
-  statistics.tempStats[temp_n].value = dhtValues.latestTemperature;
-  statistics.tempStats[temp_n].initialized = true;
-  statistics.humdStats[humd_n].value = dhtValues.latestHumidity;
-  statistics.humdStats[humd_n].initialized = true;
-
-  statistics.tempCurrentElement = ((temp_n + 1) % MAX_STATS);
-  statistics.humdCurrentElement = ((humd_n + 1) % MAX_STATS);
+  tempStats.add(dhtValues.latestTemperature);
+  humdStats.add(dhtValues.latestHumidity);
 }
 
 float getTempMean(void) {
 #if DEVMODE
   Serial.println("Calculating temp mean...");
+  Serial.printf("Temperature mean: %.2f\n", tempStats.getMean());
 #endif
-  uint32_t elements = 0;
-  double sum = 0.0;
-  tempMeasure element;
-  for (int32_t i = (MAX_STATS) - 1; i >= 0; --i) {
-    element = statistics.tempStats[i];
-    if (element.initialized == true) {
-      sum += element.value;
-      ++elements;
-#if DEVMODE
-      Serial.printf("Current sum: %f - elements found: %i\n", sum, elements);
-      delay(10);
-#endif
-    } else {
-      break;
-    }
-  }
-#if DEVMODE
-  Serial.printf("Temperature mean: %.2f (elements: %i)\n", (elements == 0) ? dhtValues.latestTemperature : (sum / elements), elements);
-#endif
-  return (elements == 0) ? dhtValues.latestTemperature : (sum / elements);
+  return (tempStats.getMean());
 }
 
 float getHumdMean(void) {
 #if DEVMODE
   Serial.println("Calculating humd mean...");
+  Serial.printf("Humidity mean: %.2f\n", humdStats.getMean());
 #endif
-  uint32_t elements = 0;
-  uint64_t sum = 0;
-  humdMeasure element;
-  for (uint32_t i = (MAX_STATS) - 1; i >= 0; --i) {
-    element = statistics.humdStats[i];
-    if (element.initialized == true) {
-      sum += element.value;
-      ++elements;
-#if DEVMODE
-      Serial.printf("Current sum: %f - elements found: %i\n", sum, elements);
-      delay(10);
-#endif
-    } else {
-      break;
-    }
-  }
-#if DEVMODE
-  Serial.printf("Humidity mean: %.2f (elements: %i)\n", (elements == 0) ? dhtValues.latestHumidity : (sum / elements), elements);
-#endif
-  return (elements == 0) ? dhtValues.latestHumidity : (sum / elements);
+  return (humdStats.getMean());
 }
 
 uint8_t normalizeValue(uint16_t analogValue) {
@@ -1135,15 +1010,20 @@ uint8_t normalizeValue(uint16_t analogValue) {
   return (i * 10);
 }
 
+void clearStats(void) {
+  tempStats.reset();
+  humdStats.reset();
+}
+
 #if OTA_ENABLED
 void lookForOTAUpdates(void) {
   if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;
+//    WiFiClient client;
 #if DEVMODE
     Serial.println(F("Looking for OTAs..."));
-    ESPhttpUpdate.setLedPin(LED_BUILTIN, LOW);
 #endif
-    t_httpUpdate_return returnValue = ESPhttpUpdate.update(client, OTA_URL, OTA_PORT, OTA_PATH, RUNNING_VERSION);
+    ESPhttpUpdate.setLedPin(LED_PIN, HIGH);
+    t_httpUpdate_return returnValue = ESPhttpUpdate.update(client, OTA_URL, RUNNING_VERSION);
 
     switch (returnValue) {
       case HTTP_UPDATE_FAILED:
@@ -1157,6 +1037,10 @@ void lookForOTAUpdates(void) {
 #endif
         break;
       case HTTP_UPDATE_OK:
+        lcd.clear();
+        lcd.write(WIFI.id);
+        lcd.print(F(" "));
+        lcd.print(F("Updating..."));
 #if DEVMODE
         Serial.println("[update] Update ok."); // may not called we reboot the ESP
 #endif
