@@ -29,6 +29,8 @@
 #include <WiFiUdp.h>
 #include <Thread.h>
 #include <ThingSpeak.h>
+#include <Time.h>
+#include <TimeLib.h>
 
 // ThingSpeak publisher class
 #include "ThingSpeakPublisher.h"
@@ -84,7 +86,7 @@
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
 // As the setup is inside a box, we have to "fix" the temperature (about 2 ºC degrees)
-#define TEMPERATURE_FIX -2.7
+#define TEMPERATURE_FIX -1.5
 #define CLEAR_ROW   "                "
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
@@ -147,6 +149,7 @@ volatile struct {
   uint16_t displayTaskSeconds;
   uint16_t otaCheckMs;
   uint32_t clearStatsSeconds;
+  uint16_t clockSyncInterval;
 } waitingTimes = {
   18,       // 18 seconds
   9000,     // 09 seconds
@@ -159,7 +162,8 @@ volatile struct {
   60,       // 60 seconds
   10,       // 10 seconds
   60000,    // 60 seconds
-  86400     // 01 day
+  86400,    // 01 day
+  60        // 60 seconds
 };
 
 struct {
@@ -194,10 +198,11 @@ struct {
 struct {
   String formattedTime;
   String formattedDate;
+  time_t prevTime;
   bool hasTimeChanged;
   bool hasDateChanged;
   bool mustShowSeparator;
-} dataTime = {"00:00 00", "1900-01-01", true, true, true};
+} dataTime = {"00:00 00", "01-01-1970", 0, true, true, true};
 
 struct {
   String ip;
@@ -262,6 +267,8 @@ bool printLCDCaptivePortalInformation(IPAddress ip);
 void changeDisplayMode(void);
 void launchClockThread(void);
 void updateTime(void);
+String formatDigits(int value);
+time_t syncTimeFromNTP(void);
 void updateDHTInfo(void);
 void updateWaterLevelInfo(void);
 bool areTimesDifferent(String time1, String time2);
@@ -369,6 +376,9 @@ void setup(void) {
 
   // Init the NTP client - if we are here there is Internet connection
   ntp.begin();
+  setSyncProvider(syncTimeFromNTP);
+  setSyncInterval(waitingTimes.clockSyncInterval);
+  setTime(syncTimeFromNTP());
 
   // Init ThingSpeak as we have network
   ThingSpeak.begin(client);
@@ -384,7 +394,7 @@ void setup(void) {
 #endif
   timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
-  timers.clockControl.setInterval(waitingTimes.clockSeconds * 1000, updateTime);
+//  timers.clockControl.setInterval(waitingTimes.clockSeconds * 1000, updateTime);
   timers.offsetControl.attach(waitingTimes.offsetSeconds, launchOffsetTask);
   timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
   timers.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000, publishTemperature);
@@ -409,7 +419,8 @@ void setup(void) {
 }
 
 void loop(void) {
-  timers.clockControl.run();
+//  timers.clockControl.run();
+  updateTime();
   timers.dhtSensor.run();
 #if OTA_ENABLED
   timers.ota.run();
@@ -701,6 +712,51 @@ void changeDisplayMode(void) {
 }
 
 void updateTime(void) {
+  if (timeStatus() != timeNotSet) {
+    if (now() != dataTime.prevTime) {
+      dataTime.prevTime = now();
+
+      // Format the date
+      String currentDay = formatDigits(day());
+      String currentMonth = formatDigits(month());
+      String currentYear = String(year());
+      String formattedDate = currentDay + "-" + currentMonth + "-" + currentYear;
+      if (formattedDate != dataTime.formattedDate) {
+        dataTime.formattedDate = formattedDate;
+        dataTime.hasDateChanged = true;
+      } else {
+        dataTime.hasDateChanged = false;
+      }
+
+      // Format the time
+      String currentHour = formatDigits(hour());
+      String currentMinutes = formatDigits(minute());
+      String currentSeconds = formatDigits(second());
+      String formattedTime = currentHour;
+      formattedTime += (dataTime.mustShowSeparator) ? ":" : " ";
+      formattedTime += currentMinutes + " " + currentSeconds;
+      // Here, times are different (prevDisplay != now())
+      dataTime.formattedTime = formattedTime;
+      dataTime.mustShowSeparator = !dataTime.mustShowSeparator;
+      dataTime.hasTimeChanged = true;
+    }
+  }
+}
+
+String formatDigits(int value) {
+  return ((value < 10) ? ("0" + String(value)) : String(value));
+}
+
+time_t syncTimeFromNTP(void) {
+  if (WiFi.status() == WL_CONNECTED) {
+    ntp.update();
+    return ((time_t) ntp.getEpochTime());
+  } else {
+    return now();
+  }
+}
+
+/*void updateTime(void) {
 #if DEVMODE
   uint32_t currentTime = millis();
   uint32_t diff = currentTime - executionTimes.latestTickerExecution;
@@ -737,7 +793,7 @@ void updateTime(void) {
     dataTime.formattedTime = "No Internet!";
     dataTime.formattedDate = "";
   }
-}
+}*/
 
 void updateDHTInfo(void) {
 #if DEVMODE
