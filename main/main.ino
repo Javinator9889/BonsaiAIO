@@ -86,7 +86,7 @@
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
 // As the setup is inside a box, we have to "fix" the temperature (about 2 ºC degrees)
-#define TEMPERATURE_FIX -1.5
+#define TEMPERATURE_FIX -3.5
 #define CLEAR_ROW   "                "
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
@@ -139,7 +139,6 @@ bool printed = false;
 volatile struct {
   uint16_t waterLevelSensor;
   uint16_t tempHumdSensor;
-  uint16_t clockSeconds;
   uint32_t offsetSeconds;
   uint32_t wifiTaskSeconds;
   uint32_t tempTaskSeconds;
@@ -153,7 +152,6 @@ volatile struct {
 } waitingTimes = {
   18,       // 18 seconds
   9000,     // 09 seconds
-  1,        // 01 second
   1800 ,    // 30 minutes
   615,      // 10 minutes 05 seconds
   332,      // 05 minutes 32 seconds
@@ -163,12 +161,11 @@ volatile struct {
   10,       // 10 seconds
   60000,    // 60 seconds
   86400,    // 01 day
-  60        // 60 seconds
+  180       // 03 minutes
 };
 
 struct {
   SimpleTimer dhtSensor;
-  SimpleTimer clockControl;
   Ticker waterSensor;
   Ticker offsetControl;
   Ticker updateStatistics;
@@ -394,7 +391,6 @@ void setup(void) {
 #endif
   timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
-//  timers.clockControl.setInterval(waitingTimes.clockSeconds * 1000, updateTime);
   timers.offsetControl.attach(waitingTimes.offsetSeconds, launchOffsetTask);
   timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
   timers.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000, publishTemperature);
@@ -419,7 +415,6 @@ void setup(void) {
 }
 
 void loop(void) {
-//  timers.clockControl.run();
   updateTime();
   timers.dhtSensor.run();
 #if OTA_ENABLED
@@ -756,45 +751,6 @@ time_t syncTimeFromNTP(void) {
   }
 }
 
-/*void updateTime(void) {
-#if DEVMODE
-  uint32_t currentTime = millis();
-  uint32_t diff = currentTime - executionTimes.latestTickerExecution;
-  Serial.print(F("Latest time execution about ")); Serial.println(String(diff) + " ms. ago");
-  executionTimes.latestTickerExecution = currentTime;
-#endif
-  if (WiFi.status() == WL_CONNECTED) {
-    ntp.update();
-
-    // Format the date
-    String ntpFormattedDate = ntp.getFormattedDate();
-    int splitIndexForDate = ntpFormattedDate.indexOf("T");
-    String formattedDate = ntpFormattedDate.substring(0, splitIndexForDate);
-    if (formattedDate != dataTime.formattedDate) {
-      dataTime.formattedDate = formattedDate;
-      dataTime.hasDateChanged = true;
-    } else {
-      dataTime.hasDateChanged = false;
-    }
-
-    // Format the time
-    String ntpTime = ntpFormattedDate.substring((splitIndexForDate + 1), (ntpFormattedDate.length() - 1));
-    String formattedTime = ntpTime.substring(0, 2);
-    formattedTime += (dataTime.mustShowSeparator) ? ":" : " ";
-    formattedTime += ntpTime.substring(3, 5) + " " + ntpTime.substring(6, 8);
-    if (areTimesDifferent(formattedTime, dataTime.formattedTime)) {
-      dataTime.formattedTime = formattedTime;
-      dataTime.mustShowSeparator = !dataTime.mustShowSeparator;
-      dataTime.hasTimeChanged = true;
-    } else {
-      dataTime.hasTimeChanged = false;
-    }
-  } else {
-    dataTime.formattedTime = "No Internet!";
-    dataTime.formattedDate = "";
-  }
-}*/
-
 void updateDHTInfo(void) {
 #if DEVMODE
   uint32_t currentTime = millis();
@@ -1074,7 +1030,6 @@ void clearStats(void) {
 #if OTA_ENABLED
 void lookForOTAUpdates(void) {
   if (WiFi.status() == WL_CONNECTED) {
-//    WiFiClient client;
 #if DEVMODE
     Serial.println(F("Looking for OTAs..."));
 #endif
