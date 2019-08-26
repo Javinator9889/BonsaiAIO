@@ -30,13 +30,9 @@
 #include <Thread.h>
 #include <ThingSpeak.h>
 #include <Time.h>
-#include <TimeLib.h>
 
 // ThingSpeak publisher class
 #include "ThingSpeakPublisher.h"
-
-// ESP8266 pinout
-//#include "PinConstants.h"
 
 // Statistics library
 #include "SensorStats.h"
@@ -103,9 +99,8 @@ NTPClient ntp(ntpUDP, NTP_SERVER);
 
 // Threads
 struct {
-  Thread offsetTask;
   Thread displayTask;
-} tasks = {Thread(), Thread()};
+} tasks = {Thread()};
 
 // Components pins
 const struct {
@@ -167,10 +162,10 @@ volatile struct {
 struct {
   SimpleTimer dhtSensor;
   Ticker waterSensor;
-  Ticker offsetControl;
   Ticker updateStatistics;
   Ticker displayTask;
   Ticker clearStatsTask;
+  SimpleTimer offsetControl;
   SimpleTimer wifiTask;
   SimpleTimer tempTask;
   SimpleTimer humdTask;
@@ -206,7 +201,9 @@ struct {
   String lat;
   String lng;
   uint16_t offset;
-} geolocationInformation = {"", "", "", 0};
+  String connectedSSID;
+} geolocationInformation = {"", "", "", 0, ""};
+
 
 // MQTT information
 ThingSpeakPublisher mqttWiFi(CHANNEL_ID, THINGSPEAK_API, 1, client);
@@ -252,6 +249,7 @@ void initAutoConnect(String password);
 void initDHT(void);
 void initWaterValuesPercentages(void);
 void createLCDCustomCharacters(void);
+void substituteBonsaiChar(void);
 void lcdPrintTime(void);
 void lcdPrintDHT(void);
 void lcdPrintWaterLevel(void);
@@ -262,25 +260,21 @@ void rootPage(void);
 String generateRandomString(void);
 bool printLCDCaptivePortalInformation(IPAddress ip);
 void changeDisplayMode(void);
-void launchClockThread(void);
 void updateTime(void);
 String formatDigits(int value);
 time_t syncTimeFromNTP(void);
 void updateDHTInfo(void);
 void updateWaterLevelInfo(void);
 bool areTimesDifferent(String time1, String time2);
-void setupLatituteLongitude(void);
+void setupLatitudeLongitude(void);
 void getTimezoneOffset(void);
 void setupClock(void);
-void launchOffsetTask(void);
 void launchDisplayTask(void);
 void publishWiFiStrength(void);
 void publishTemperature(void);
 void publishHumidity(void);
 void publishWaterLevel(void);
 void statisticsUpdate(void);
-float getTempMean(void);
-float getHumdMean(void);
 uint8_t normalizeValue(uint16_t analogValue);
 void clearStats(void);
 #if OTA_ENABLED
@@ -381,8 +375,6 @@ void setup(void) {
   ThingSpeak.begin(client);
 
   // Setup timers
-  tasks.offsetTask.onRun(setupClock);
-  tasks.offsetTask.setInterval(waitingTimes.offsetSeconds * 1000);
   tasks.displayTask.onRun(changeDisplayMode);
   tasks.displayTask.setInterval(waitingTimes.displayTaskSeconds * 1000);
 
@@ -391,7 +383,7 @@ void setup(void) {
 #endif
   timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
-  timers.offsetControl.attach(waitingTimes.offsetSeconds, launchOffsetTask);
+  timers.offsetControl.setInterval(waitingTimes.offsetSeconds * 1000, setupClock);
   timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
   timers.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000, publishTemperature);
   timers.humdTask.setInterval(waitingTimes.humdTaskSeconds * 1000, publishHumidity);
@@ -404,6 +396,7 @@ void setup(void) {
   updateWaterLevelInfo();
   updateTime();
   statisticsUpdate();
+  substituteBonsaiChar();
 
   digitalWrite(LED_PIN, LOW);
 
@@ -415,6 +408,7 @@ void setup(void) {
 }
 
 void loop(void) {
+  timers.offsetControl.run();
   updateTime();
   timers.dhtSensor.run();
 #if OTA_ENABLED
@@ -424,22 +418,25 @@ void loop(void) {
   switch((uint8_t) displayMode) {
     case DEFAULT_MODE:
       lcdPrintTime();
+      lcdPrintWaterLevel();
       lcdPrintDHT();
       break;
     case AVG_TEMP_HUM_MODE:
       lcdPrintTime();
-      lcdPrintAvgDHT();
-      break;
-    case WATER_LEVEL_INDICATOR:
-      lcdPrintTime();
       lcdPrintWaterLevel();
+      lcdPrintAvgDHT();
       break;
     case CLOCK_AND_DATE:
       lcdPrintTime();
+      lcdPrintWaterLevel();
       lcdPrintDate();
       break;
     case WIFI_INFORMATION:
       lcdPrintWiFiInformation();
+      break;
+    case DISPLAY_CLEAR:
+      lcd.clear();
+      displayMode = DEFAULT_MODE;
       break;
     default:
       displayMode = DEFAULT_MODE;
@@ -458,8 +455,6 @@ void initAutoConnect(String password) {
   config.retainPortal = false;
   config.hostName = "BonsaiAIO";
   config.title = "BonsaiAIO";
-  config.dns1 = IPAddress(8, 8, 8, 8);
-  config.dns2 = IPAddress(8, 8, 4, 4);
 }
 
 void initDHT(void) {
@@ -525,6 +520,10 @@ void createLCDCustomCharacters(void) {
   lcd.createChar(BONSAI.id, BONSAI.icon);
 }
 
+void substituteBonsaiChar(void) {
+  lcd.createChar(WATER_LEVEL_50.id, WATER_LEVEL_50.icon);
+}
+
 void lcdPrintTime(void) {
   if (dataTime.hasTimeChanged || displayModeChanged) {
 #if DEVMODE
@@ -533,12 +532,12 @@ void lcdPrintTime(void) {
     delay(10);
 #endif
     lcd.home();
-    lcd.print(CLEAR_ROW);
+    lcd.print(F("        "));
     lcd.home();
-    lcd.print(F("    "));
+    lcd.print(F(" "));
     lcd.print(dataTime.formattedTime);
-    lcd.print(F("    "));
-    dataTime.hasTimeChanged = false;
+    if (dataTime.hasTimeChanged)
+      dataTime.hasTimeChanged = false;
   }
 }
 
@@ -558,13 +557,15 @@ void lcdPrintDHT(void) {
     lcd.print(F(" "));
     lcd.print((char)223);
     lcd.print(F("C"));
-    dhtValues.hasTempChanged = false;
+    if (dhtValues.hasTempChanged)
+      dhtValues.hasTempChanged = false;
     lcd.setCursor(9, 1);
     lcd.print(F("  "));
     lcd.write(WATER_DROP.id);
     lcd.print(dhtValues.latestHumidity, 0);
     lcd.print(F("%"));
-    dhtValues.hasHumdChanged = false;
+    if (dhtValues.hasHumdChanged)
+      dhtValues.hasHumdChanged = false;
   }
   if (displayModeChanged)
       displayModeChanged = false;
@@ -577,27 +578,27 @@ void lcdPrintWaterLevel(void) {
     waterLevelValues.hasWaterValueChanged = false;
     delay(10);
 #endif
-    lcd.setCursor(0, 1);
-    lcd.print(CLEAR_ROW);
+    lcd.setCursor(8, 0);
+    lcd.print(F("        "));
     if (waterLevelValues.waterValue < 25) {
       digitalWrite(LED_PIN, HIGH);
-      lcd.setCursor(4, 1);
-      lcd.print(F("! "));
+      lcd.setCursor(8, 0);
+      lcd.print(F("!"));
       lcd.write(WATER_LEVEL_EMPTY.id);
-    } else if ((waterLevelValues.waterValue >= 25) && (waterLevelValues.waterValue < 50)) {
-      digitalWrite(LED_PIN, LOW);
-      lcd.setCursor(6, 1);
-      lcd.write(WATER_LEVEL_25.id);
     } else {
       digitalWrite(LED_PIN, LOW);
-      lcd.setCursor(6, 1);
-      lcd.write(WATER_LEVEL_75.id);
+      lcd.setCursor(9, 0);
+      if ((waterLevelValues.waterValue >= 40) && (waterLevelValues.waterValue <= 60)) {
+        lcd.write(WATER_LEVEL_50.id);
+      } else if (waterLevelValues.waterValue < 40) {
+        lcd.write(WATER_LEVEL_25.id);
+      } else {
+        lcd.write(WATER_LEVEL_75.id);
+      }
     }
     lcd.print(F(" "));
     lcd.print(waterLevelValues.waterValue);
     lcd.print(F("%"));
-    if (displayModeChanged)
-      displayModeChanged = false;
     if (waterLevelValues.hasWaterValueChanged)
       waterLevelValues.hasWaterValueChanged = false;
   }
@@ -614,32 +615,29 @@ void lcdPrintDate(void) {
     lcd.print(CLEAR_ROW);
     lcd.setCursor(3, 1);
     lcd.print(dataTime.formattedDate);
+    if (dataTime.hasDateChanged)
+      dataTime.hasDateChanged = false;
     if (displayModeChanged)
       displayModeChanged = false;
   }
 }
 
 void lcdPrintAvgDHT(void) {
-  if (dhtValues.hasTempChanged || displayModeChanged) {
+  if (displayModeChanged) {
     lcd.setCursor(0, 1);
     lcd.print(F("/"));
     lcd.write(TERMOMETER.id);
-    lcd.print(getTempMean(), 2);
+    lcd.print(tempStats.getMean(), 2);
     lcd.print(F(" "));
     lcd.print((char)223);
     lcd.print(F("C"));
-    dhtValues.hasTempChanged = false;
-  }
-  if (dhtValues.hasHumdChanged || displayModeChanged) {
     lcd.setCursor(10, 1);
     lcd.print(F(" /"));
     lcd.write(WATER_DROP.id);
-    lcd.print(getHumdMean(), 0);
+    lcd.print(humdStats.getMean(), 0);
     lcd.print(F("%"));
-    dhtValues.hasHumdChanged = false;
-  }
-  if (displayModeChanged)
-      displayModeChanged = false;
+    displayModeChanged = false;
+  }      
 }
 
 void lcdPrintWiFiInformation(void) {
@@ -729,7 +727,7 @@ void updateTime(void) {
       String currentSeconds = formatDigits(second());
       String formattedTime = currentHour;
       formattedTime += (dataTime.mustShowSeparator) ? ":" : " ";
-      formattedTime += currentMinutes + " " + currentSeconds;
+      formattedTime += currentMinutes; // + " " + currentSeconds;
       // Here, times are different (prevDisplay != now())
       dataTime.formattedTime = formattedTime;
       dataTime.mustShowSeparator = !dataTime.mustShowSeparator;
@@ -828,39 +826,42 @@ bool areTimesDifferent(String time1, String time2) {
     return false;
 }
 
-void setupLatituteLongitude(void) {
+void setupLatitudeLongitude(void) {
   if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
+    if (geolocationInformation.connectedSSID != WiFi.SSID()) {
+      HTTPClient http;
 #if DEVMODE
-    Serial.print(F("EXTREME URL: "));
-    Serial.println(EXTREME_IP_URL);
+      Serial.print(F("EXTREME URL: "));
+      Serial.println(EXTREME_IP_URL);
 #endif
-    http.begin(client, EXTREME_IP_URL);
-    int httpCode = http.GET();
-    if (httpCode > 0) {
-      DynamicJsonDocument jsonBuffer(EXTREME_IP_BUFFER_SIZE);
-      DeserializationError error = deserializeJson(jsonBuffer, http.getString());
-      if (error == DeserializationError::Ok) {
+      http.begin(client, EXTREME_IP_URL);
+      int httpCode = http.GET();
+      if (httpCode > 0) {
+        DynamicJsonDocument jsonBuffer(EXTREME_IP_BUFFER_SIZE);
+        DeserializationError error = deserializeJson(jsonBuffer, http.getString());
+        if (error == DeserializationError::Ok) {
 #if DEVMODE
-        Serial.println(jsonBuffer["lat"].as<float>());
-        Serial.println(jsonBuffer["lon"].as<float>());
+          Serial.println(jsonBuffer["lat"].as<float>());
+          Serial.println(jsonBuffer["lon"].as<float>());
 #endif
-        geolocationInformation.lat = jsonBuffer["lat"].as<String>();
-        geolocationInformation.lng = jsonBuffer["lon"].as<String>();
-      } else {
+          geolocationInformation.lat = jsonBuffer["lat"].as<String>();
+          geolocationInformation.lng = jsonBuffer["lon"].as<String>();
+        } else {
 #if DEVMODE
-        Serial.print(F("\"IP-API\" deserializeJson() failed with code "));
-        Serial.println(error.c_str());
+          Serial.print(F("\"IP-API\" deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+#endif
+        }
+        jsonBuffer.clear();
+      }
+      else {
+#if DEVMODE
+        Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
 #endif
       }
-      jsonBuffer.clear();
+      http.end();
+      geolocationInformation.connectedSSID = WiFi.SSID();
     }
-    else {
-#if DEVMODE
-      Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
-#endif
-    }
-    http.end();
   }
 }
 
@@ -901,13 +902,9 @@ void getTimezoneOffset(void) {
 }
 
 void setupClock(void) {
-  setupLatituteLongitude();
+  setupLatitudeLongitude();
   getTimezoneOffset();
   ntp.setTimeOffset(geolocationInformation.offset);
-}
-
-void launchOffsetTask(void) {
-  tasks.offsetTask.run();
 }
 
 void launchDisplayTask(void) {
@@ -991,22 +988,6 @@ void statisticsUpdate(void) {
 #endif
   tempStats.add(dhtValues.latestTemperature);
   humdStats.add(dhtValues.latestHumidity);
-}
-
-float getTempMean(void) {
-#if DEVMODE
-  Serial.println("Calculating temp mean...");
-  Serial.printf("Temperature mean: %.2f\n", tempStats.getMean());
-#endif
-  return (tempStats.getMean());
-}
-
-float getHumdMean(void) {
-#if DEVMODE
-  Serial.println("Calculating humd mean...");
-  Serial.printf("Humidity mean: %.2f\n", humdStats.getMean());
-#endif
-  return (humdStats.getMean());
 }
 
 uint8_t normalizeValue(uint16_t analogValue) {

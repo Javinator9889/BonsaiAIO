@@ -3,13 +3,16 @@
         {
             "name": "Linux",
             "includePath": [
+                "/home/javinator9889/.arduino15/packages/esp8266/tools/**",
+                "/home/javinator9889/.arduino15/packages/esp8266/hardware/esp8266/2.5.2/**",
                 "${workspaceFolder}/**"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c11",
             "cppStandard": "c++17",
-            "intelliSenseMode": "clang-x64"
+            "intelliSenseMode": "clang-x64",
+            "forcedInclude": []
         }
     ],
     "version": 4
