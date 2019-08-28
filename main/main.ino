@@ -82,7 +82,7 @@
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
 // As the setup is inside a box, we have to "fix" the temperature (about 2 ºC degrees)
-#define TEMPERATURE_FIX -3.5
+#define TEMPERATURE_FIX -2.3
 #define CLEAR_ROW   "                "
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
@@ -185,7 +185,9 @@ struct {
 struct {
   uint8_t waterValue;
   bool hasWaterValueChanged;
-} waterLevelValues = {0, true};
+  uint16_t lowerLimit;
+  uint16_t upperLimit;
+} waterLevelValues = {0, true, 336, 1023};
 
 struct {
   String formattedTime;
@@ -211,17 +213,8 @@ ThingSpeakPublisher mqttTemp(CHANNEL_ID, THINGSPEAK_API, 2, client);
 ThingSpeakPublisher mqttHumd(CHANNEL_ID, THINGSPEAK_API, 3, client);
 ThingSpeakPublisher mqttWlvl(CHANNEL_ID, THINGSPEAK_API, 4, client);
 
-typedef struct {
-  int16_t upperLimit;
-  int16_t lowerLimit;
-} percentagesLimit;
-
 SensorStats tempStats;
 SensorStats humdStats;
-
-struct {
-  percentagesLimit percentageLimit[11];
-} waterLevelPercentages = {{0, 0}};
 
 #if DEVMODE
 struct {
@@ -247,7 +240,6 @@ long latestRSSI = 0;
 // available
 void initAutoConnect(String password);
 void initDHT(void);
-void initWaterValuesPercentages(void);
 void createLCDCustomCharacters(void);
 void substituteBonsaiChar(void);
 void lcdPrintTime(void);
@@ -275,7 +267,6 @@ void publishTemperature(void);
 void publishHumidity(void);
 void publishWaterLevel(void);
 void statisticsUpdate(void);
-uint8_t normalizeValue(uint16_t analogValue);
 void clearStats(void);
 #if OTA_ENABLED
 void lookForOTAUpdates(void);
@@ -306,7 +297,6 @@ void setup(void) {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
   initDHT();
-  initWaterValuesPercentages();
   createLCDCustomCharacters();
 
   lcd.home();
@@ -488,27 +478,6 @@ void initDHT(void) {
 #endif
 }
 
-void initWaterValuesPercentages(void) {
-  waterLevelPercentages.percentageLimit[9].upperLimit = 250;
-  waterLevelPercentages.percentageLimit[9].lowerLimit = 240;
-  waterLevelPercentages.percentageLimit[8].upperLimit = 240;
-  waterLevelPercentages.percentageLimit[8].lowerLimit = 230;
-  waterLevelPercentages.percentageLimit[7].upperLimit = 230;
-  waterLevelPercentages.percentageLimit[7].lowerLimit = 220;
-  waterLevelPercentages.percentageLimit[6].upperLimit = 220;
-  waterLevelPercentages.percentageLimit[6].lowerLimit = 210;
-  waterLevelPercentages.percentageLimit[5].upperLimit = 210;
-  waterLevelPercentages.percentageLimit[5].lowerLimit = 200;
-  waterLevelPercentages.percentageLimit[4].upperLimit = 200;
-  waterLevelPercentages.percentageLimit[4].lowerLimit = 190;
-  waterLevelPercentages.percentageLimit[3].upperLimit = 190;
-  waterLevelPercentages.percentageLimit[3].lowerLimit = 180;
-  waterLevelPercentages.percentageLimit[2].upperLimit = 180;
-  waterLevelPercentages.percentageLimit[2].lowerLimit = 150;
-  waterLevelPercentages.percentageLimit[1].upperLimit = 150;
-  waterLevelPercentages.percentageLimit[1].lowerLimit = 120;
-}
-
 void createLCDCustomCharacters(void) {
   lcd.createChar(WATER_DROP.id, WATER_DROP.icon);
   lcd.createChar(TERMOMETER.id, TERMOMETER.icon);
@@ -580,7 +549,7 @@ void lcdPrintWaterLevel(void) {
 #endif
     lcd.setCursor(8, 0);
     lcd.print(F("        "));
-    if (waterLevelValues.waterValue < 25) {
+    if (waterLevelValues.waterValue <= 25) {
       digitalWrite(LED_PIN, HIGH);
       lcd.setCursor(8, 0);
       lcd.print(F("!"));
@@ -803,7 +772,8 @@ void updateWaterLevelInfo(void) {
   executionTimes.latestWaterExecution = currentTime;
 #endif
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
-  uint8_t percentageWaterValue = normalizeValue(currentWaterValue);
+  uint8_t percentageWaterValue = map(currentWaterValue, waterLevelValues.upperLimit, 
+                                     waterLevelValues.lowerLimit, 0, 100);
   if (percentageWaterValue != waterLevelValues.waterValue) {
     waterLevelValues.waterValue = percentageWaterValue;
     waterLevelValues.hasWaterValueChanged = true;
@@ -988,19 +958,6 @@ void statisticsUpdate(void) {
 #endif
   tempStats.add(dhtValues.latestTemperature);
   humdStats.add(dhtValues.latestHumidity);
-}
-
-uint8_t normalizeValue(uint16_t analogValue) {
-  if (analogValue >= UPPER_LIMIT)
-    return 100;
-  else if (analogValue <= LOWER_LIMIT)
-    return 0;
-  uint8_t i = 9;
-  for ( ; i >= 1; --i) {
-    if ((analogValue >= waterLevelPercentages.percentageLimit[i].lowerLimit) && (analogValue < waterLevelPercentages.percentageLimit[i].upperLimit))
-      break;
-  }
-  return (i * 10);
 }
 
 void clearStats(void) {
