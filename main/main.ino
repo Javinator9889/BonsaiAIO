@@ -6,12 +6,16 @@
 */
 
 // Web control & WiFi libraries
+extern "C" {
+  #include "user_interface.h"
+}
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WiFiMulti.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
+#include <AutoConnectCredential.h>
 
 // Components specific libraries
 #include <LiquidCrystal595.h>
@@ -58,6 +62,8 @@
 
 #if DEVMODE
 #define PRINT_DEBUG_MESSAGES
+#else
+#undef AC_DEBUG
 #endif
 
 #if OTA_ENABLED
@@ -86,12 +92,15 @@
 #define CLEAR_ROW   "                "
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
+#define CREDENTIAL_OFFSET 0
 
 // Web control objects
 WiFiClient client;
-ESP8266WebServer  Server;
-AutoConnect       Portal(Server);
-AutoConnectConfig config;
+ESP8266WebServer      Server;
+AutoConnect           Portal(Server);
+AutoConnectConfig     config;
+AutoConnectCredential credentials(CREDENTIAL_OFFSET);
+ESP8266WiFiMulti      wifiMulti;
 
 // Time components
 WiFiUDP ntpUDP;
@@ -144,19 +153,21 @@ volatile struct {
   uint16_t otaCheckMs;
   uint32_t clearStatsSeconds;
   uint16_t clockSyncInterval;
+  uint16_t wifiStatusTask;
 } waitingTimes = {
-  18,       // 18 seconds
+  30,       // 30 seconds
   9000,     // 09 seconds
   1800 ,    // 30 minutes
-  615,      // 10 minutes 05 seconds
-  332,      // 05 minutes 32 seconds
-  297,      // 04 minutes 57 seconds
-  1807,     // 30 minutes 07 seconds
+  647,      // 10 minutes 47 seconds
+  283,      // 04 minutes 23 seconds
+  315,      // 05 minutes 15 seconds
+  421,      // 07 minutes 01 seconds
   60,       // 60 seconds
-  10,       // 10 seconds
+  15,       // 15 seconds
   60000,    // 60 seconds
   86400,    // 01 day
-  180       // 03 minutes
+  180,      // 03 minutes
+  5,        // 05 seconds
 };
 
 struct {
@@ -165,6 +176,7 @@ struct {
   Ticker updateStatistics;
   Ticker displayTask;
   Ticker clearStatsTask;
+  SimpleTimer wifiStatusTask;
   SimpleTimer offsetControl;
   SimpleTimer wifiTask;
   SimpleTimer tempTask;
@@ -187,7 +199,7 @@ struct {
   bool hasWaterValueChanged;
   uint16_t lowerLimit;
   uint16_t upperLimit;
-} waterLevelValues = {0, true, 336, 1023};
+} waterLevelValues = {0, true, 450, 900};
 
 struct {
   String formattedTime;
@@ -235,6 +247,7 @@ String password;
 volatile bool hasDisplayModeBeenPrinted[N_DISPLAY_MODES] = {false};
 String latestSSID = "";
 long latestRSSI = 0;
+bool portalExecuted = false;
 
 // Define the functions that will be
 // available
@@ -249,6 +262,7 @@ void lcdPrintDate(void);
 void lcdPrintAvgDHT(void);
 void lcdPrintWiFiInformation(void);
 void rootPage(void);
+void lcdPrintWiFiIP(void);
 String generateRandomString(void);
 bool printLCDCaptivePortalInformation(IPAddress ip);
 void changeDisplayMode(void);
@@ -258,6 +272,7 @@ time_t syncTimeFromNTP(void);
 void updateDHTInfo(void);
 void updateWaterLevelInfo(void);
 bool areTimesDifferent(String time1, String time2);
+uint8_t toWiFiQuality(int32_t rssi);
 void setupLatitudeLongitude(void);
 void getTimezoneOffset(void);
 void setupClock(void);
@@ -268,6 +283,7 @@ void publishHumidity(void);
 void publishWaterLevel(void);
 void statisticsUpdate(void);
 void clearStats(void);
+void handleWifiStatus(void);
 #if OTA_ENABLED
 void lookForOTAUpdates(void);
 #endif
@@ -306,7 +322,7 @@ void setup(void) {
   delay(2000);
   lcd.setCursor(0, 1);
   lcd.print("Initializing...");
-
+  
   password = generateRandomString();
   initAutoConnect(password);
 #if DEVMODE
@@ -317,6 +333,7 @@ void setup(void) {
   Server.on("/", rootPage);
   Portal.config(config);
   Portal.onDetect(printLCDCaptivePortalInformation);
+  digitalWrite(LED_PIN, LOW);
   if (Portal.begin()) {
 #if DEVMODE
     Serial.println(F("Successfully connected to Internet!"));
@@ -326,7 +343,6 @@ void setup(void) {
     lcd.home();
     lcd.print("WiFi connected!");
     lcd.setCursor(0, 1);
-    lcd.print("IP: ");
     lcd.print(WiFi.localIP().toString());
     delay(5000);
   } else {
@@ -381,14 +397,13 @@ void setup(void) {
   timers.updateStatistics.attach(waitingTimes.statisticsTaskSeconds, statisticsUpdate);
   timers.displayTask.attach(waitingTimes.displayTaskSeconds, changeDisplayMode);
   timers.clearStatsTask.attach(waitingTimes.clearStatsSeconds, clearStats);
+  timers.wifiStatusTask.setInterval(waitingTimes.wifiStatusTask * 1000, handleWifiStatus);
 
   updateDHTInfo();
   updateWaterLevelInfo();
   updateTime();
   statisticsUpdate();
   substituteBonsaiChar();
-
-  digitalWrite(LED_PIN, LOW);
 
 #if DEVMODE
   setupFinishedTime = millis();
@@ -398,6 +413,7 @@ void setup(void) {
 }
 
 void loop(void) {
+  timers.wifiStatusTask.run();
   timers.offsetControl.run();
   updateTime();
   timers.dhtSensor.run();
@@ -426,7 +442,12 @@ void loop(void) {
       break;
     case DISPLAY_CLEAR:
       lcd.clear();
-      displayMode = DEFAULT_MODE;
+      displayMode = IP_INFORMATION;
+      break;
+    case IP_INFORMATION:
+      lcdPrintTime();
+      lcdPrintWaterLevel();
+      lcdPrintWiFiIP();
       break;
     default:
       displayMode = DEFAULT_MODE;
@@ -443,8 +464,12 @@ void initAutoConnect(String password) {
   config.apid = "BonsaiAIO";
   config.psk = password;
   config.retainPortal = false;
+  config.autoReconnect = true;
   config.hostName = "BonsaiAIO";
   config.title = "BonsaiAIO";
+  config.ticker = true;
+  config.tickerPort = LED_PIN;
+  config.tickerOn = HIGH;
 }
 
 void initDHT(void) {
@@ -549,7 +574,7 @@ void lcdPrintWaterLevel(void) {
 #endif
     lcd.setCursor(8, 0);
     lcd.print(F("        "));
-    if (waterLevelValues.waterValue <= 25) {
+    if (waterLevelValues.waterValue <= 30) {
       digitalWrite(LED_PIN, HIGH);
       lcd.setCursor(8, 0);
       lcd.print(F("!"));
@@ -613,6 +638,7 @@ void lcdPrintWiFiInformation(void) {
   if (WiFi.status() == WL_CONNECTED) {
     long rssi = WiFi.RSSI();
     String ssid = WiFi.SSID();
+    uint8_t wifiQuality = toWiFiQuality(rssi);
     if (displayModeChanged || (rssi != latestRSSI) || (ssid != latestSSID)) {
       lcd.clear();
       lcd.print(ssid.c_str());
@@ -620,17 +646,31 @@ void lcdPrintWiFiInformation(void) {
       lcd.write(WIFI.id);
       lcd.print(F(" "));
       lcd.print(rssi);
-      lcd.print(F(" dBm"));
+      lcd.print(F(" dBm - "));
+      lcd.print(wifiQuality);
+      lcd.print(F("%"));
       latestRSSI = rssi;
       latestSSID = ssid;
       if (displayModeChanged)
         displayModeChanged = false;
     }
   } else {
-    Server.on("/", rootPage);
-    Portal.config(config);
-    Portal.onDetect(printLCDCaptivePortalInformation);
-    Portal.begin();
+    if (!portalExecuted) {
+      portalExecuted = true;
+      if (Portal.begin()) {
+        portalExecuted = false;
+      }
+    }
+  }
+}
+
+void lcdPrintWiFiIP(void) {
+  if (displayModeChanged) {
+    lcd.setCursor(0, 1);
+    lcd.print(CLEAR_ROW);
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString().c_str());
+    displayModeChanged = false;
   }
 }
 
@@ -774,6 +814,8 @@ void updateWaterLevelInfo(void) {
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
   uint8_t percentageWaterValue = map(currentWaterValue, waterLevelValues.upperLimit, 
                                      waterLevelValues.lowerLimit, 0, 100);
+  if (percentageWaterValue > 100)
+    percentageWaterValue = 100;
   if (percentageWaterValue != waterLevelValues.waterValue) {
     waterLevelValues.waterValue = percentageWaterValue;
     waterLevelValues.hasWaterValueChanged = true;
@@ -794,6 +836,19 @@ bool areTimesDifferent(String time1, String time2) {
     return true;
   else
     return false;
+}
+
+uint8_t toWiFiQuality(int32_t rssi) { 
+    unsigned int qu; 
+    if (rssi == 31) // WiFi signal is weak and RSSI value is unreliable. 
+        qu = 0; 
+    else if (rssi <= -100) 
+        qu = 0; 
+    else if (rssi >= -50) 
+        qu = 100; 
+    else 
+        qu = 2 * (rssi + 100); 
+    return qu;
 }
 
 void setupLatitudeLongitude(void) {
@@ -963,6 +1018,19 @@ void statisticsUpdate(void) {
 void clearStats(void) {
   tempStats.reset();
   humdStats.reset();
+}
+
+void handleWifiStatus(void) {
+  if (WiFi.status() != WL_CONNECTED) {
+    uint8_t configs = credentials.entries();
+    struct station_config savedConfig;
+    for (int i = 0; i < configs; ++i) {
+      credentials.load(i, &savedConfig);
+      wifiMulti.addAP((const char *) savedConfig.ssid, (const char *) savedConfig.password);
+    }
+    wifiMulti.run();
+  }
+  return;
 }
 
 #if OTA_ENABLED
