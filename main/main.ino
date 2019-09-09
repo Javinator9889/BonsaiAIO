@@ -12,6 +12,7 @@ extern "C" {
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WiFiMulti.h>
+#include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
@@ -31,7 +32,6 @@ extern "C" {
 // Other libraries
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#include <Thread.h>
 #include <ThingSpeak.h>
 #include <Time.h>
 
@@ -49,6 +49,9 @@ extern "C" {
 
 // LCD Icons
 #include "LCDIcons.h"
+
+// HTML pages
+#include "CustomHTML.h"
 
 // Define whether the DEVMODE is active
 // for saving sketch size - set to 0 for
@@ -87,12 +90,12 @@ extern "C" {
 #define NTP_SERVER  "pool.ntp.org"
 #define DHT_TYPE    DHT11
 #define DHT_PIN     D1
-// As the setup is inside a box, we have to "fix" the temperature (about 2 ºC degrees)
-#define TEMPERATURE_FIX -2.3
 #define CLEAR_ROW   "                "
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
-#define CREDENTIAL_OFFSET 0
+#define EEPROM_SIZE 4096
+#define EEPROM_CRCI 0x001
+#define CREDENTIAL_OFFSET (sizeof(float) + sizeof(bool) + sizeof(short) + (4 * sizeof(int)))
 
 // Web control objects
 WiFiClient client;
@@ -105,11 +108,6 @@ ESP8266WiFiMulti      wifiMulti;
 // Time components
 WiFiUDP ntpUDP;
 NTPClient ntp(ntpUDP, NTP_SERVER);
-
-// Threads
-struct {
-  Thread displayTask;
-} tasks = {Thread()};
 
 // Components pins
 const struct {
@@ -140,7 +138,7 @@ bool printed = false;
 
 // Constant structs that contains
 // application data
-volatile struct {
+struct {
   uint16_t waterLevelSensor;
   uint16_t tempHumdSensor;
   uint32_t offsetSeconds;
@@ -149,19 +147,19 @@ volatile struct {
   uint32_t humdTaskSeconds;
   uint32_t wlvlTaskSeconds;
   uint32_t statisticsTaskSeconds;
-  uint16_t displayTaskSeconds;
+  int      displayTaskSeconds;
   uint16_t otaCheckMs;
   uint32_t clearStatsSeconds;
   uint16_t clockSyncInterval;
   uint16_t wifiStatusTask;
 } waitingTimes = {
-  30,       // 30 seconds
+  60,       // 60 seconds
   9000,     // 09 seconds
   1800 ,    // 30 minutes
-  647,      // 10 minutes 47 seconds
-  283,      // 04 minutes 23 seconds
-  315,      // 05 minutes 15 seconds
-  421,      // 07 minutes 01 seconds
+  660,      // 11 minutes
+  300,      // 05 minutes
+  320,      // 05 minutes 20 seconds
+  680,      // 11 minutes 20 seconds
   60,       // 60 seconds
   15,       // 15 seconds
   60000,    // 60 seconds
@@ -218,6 +216,23 @@ struct {
   String connectedSSID;
 } geolocationInformation = {"", "", "", 0, ""};
 
+struct {
+  float temperatureFix;
+  bool  ledEnabled;
+  int   warningLedPercentage;
+  int   tempFixAddress;
+  int   ledEnabledAddress;
+  int   warningLedPercentageAddress;
+  int   displayTaskSecsAddress;
+  int   waterLevelTimeAddress;
+  int   tempHumdTimeAddress;
+} options = {0.0f, true, 30, sizeof(short), 
+                             (sizeof(short) + sizeof(float)),
+                             (sizeof(short) + sizeof(float) + sizeof(bool)),
+                             (sizeof(short) + sizeof(float) + sizeof(bool) + sizeof(int)),
+                             (sizeof(short) + sizeof(float) + sizeof(bool) + (2 * sizeof(int))),
+                             (sizeof(short) + sizeof(float) + sizeof(bool) + (3 * sizeof(int)))};
+
 
 // MQTT information
 ThingSpeakPublisher mqttWiFi(CHANNEL_ID, THINGSPEAK_API, 1, client);
@@ -248,9 +263,12 @@ volatile bool hasDisplayModeBeenPrinted[N_DISPLAY_MODES] = {false};
 String latestSSID = "";
 long latestRSSI = 0;
 bool portalExecuted = false;
+unsigned long wifiExecutionTime = 0L;
+int dhtId;
 
 // Define the functions that will be
 // available
+void initEEPROM(void);
 void initAutoConnect(String password);
 void initDHT(void);
 void createLCDCustomCharacters(void);
@@ -262,6 +280,8 @@ void lcdPrintDate(void);
 void lcdPrintAvgDHT(void);
 void lcdPrintWiFiInformation(void);
 void rootPage(void);
+void handleGPIO(void);
+void sendRedirect(String uri);
 void lcdPrintWiFiIP(void);
 String generateRandomString(void);
 bool printLCDCaptivePortalInformation(IPAddress ip);
@@ -276,7 +296,6 @@ uint8_t toWiFiQuality(int32_t rssi);
 void setupLatitudeLongitude(void);
 void getTimezoneOffset(void);
 void setupClock(void);
-void launchDisplayTask(void);
 void publishWiFiStrength(void);
 void publishTemperature(void);
 void publishHumidity(void);
@@ -318,11 +337,12 @@ void setup(void) {
   lcd.home();
   lcd.print(F("   "));
   lcd.write(BONSAI.id);
-  lcd.print("BonsaiAIO");
+  lcd.print(F("BonsaiAIO"));
   delay(2000);
   lcd.setCursor(0, 1);
-  lcd.print("Initializing...");
+  lcd.print(F("Initializing..."));
   
+  initEEPROM();
   password = generateRandomString();
   initAutoConnect(password);
 #if DEVMODE
@@ -330,7 +350,8 @@ void setup(void) {
   Serial.printf("AP SSID: BonsaiAIO\n\rAP password: %s\n\r", password.c_str());
 #endif
   // Start the web server and cautive portal
-  Server.on("/", rootPage);
+  Server.on(F("/"), rootPage);
+  Server.on(F("/io"), handleGPIO);
   Portal.config(config);
   Portal.onDetect(printLCDCaptivePortalInformation);
   digitalWrite(LED_PIN, LOW);
@@ -341,7 +362,7 @@ void setup(void) {
 #endif
     lcd.clear();
     lcd.home();
-    lcd.print("WiFi connected!");
+    lcd.print(F("WiFi connected!"));
     lcd.setCursor(0, 1);
     lcd.print(WiFi.localIP().toString());
     delay(5000);
@@ -350,6 +371,10 @@ void setup(void) {
     Serial.println(F("Error connecting to Internet"));
 #endif
   }
+  lcd.clear();
+  lcd.print(F("Getting time"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("from Internet..."));
 
   // Global variables definition
 #if DEVMODE
@@ -377,17 +402,18 @@ void setup(void) {
   setSyncInterval(waitingTimes.clockSyncInterval);
   setTime(syncTimeFromNTP());
 
+  // Inform that we are starting now
+  lcd.clear();
+  lcd.print(F("Starting..."));
+
   // Init ThingSpeak as we have network
   ThingSpeak.begin(client);
 
   // Setup timers
-  tasks.displayTask.onRun(changeDisplayMode);
-  tasks.displayTask.setInterval(waitingTimes.displayTaskSeconds * 1000);
-
 #if OTA_ENABLED
   timers.ota.setInterval(waitingTimes.otaCheckMs, lookForOTAUpdates);
 #endif
-  timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
+  dhtId = timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
   timers.offsetControl.setInterval(waitingTimes.offsetSeconds * 1000, setupClock);
   timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
@@ -460,16 +486,39 @@ void loop(void) {
 }
 
 
+void initEEPROM(void) {
+  short eepromCrcI;
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.get(0, eepromCrcI);
+  if (eepromCrcI != EEPROM_CRCI) {
+    EEPROM.put(0, EEPROM_CRCI);
+    EEPROM.put(options.tempFixAddress, options.temperatureFix);
+    EEPROM.put(options.ledEnabledAddress, options.ledEnabled);
+    EEPROM.put(options.warningLedPercentageAddress, options.warningLedPercentage);
+    EEPROM.put(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
+    EEPROM.put(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
+    EEPROM.put(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
+    EEPROM.commit();
+  } else {
+    EEPROM.get(options.tempFixAddress, options.temperatureFix);
+    EEPROM.get(options.ledEnabledAddress, options.ledEnabled);
+    EEPROM.get(options.warningLedPercentageAddress, options.warningLedPercentage);
+    EEPROM.get(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
+    EEPROM.get(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
+    EEPROM.get(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
+  }
+}
+
 void initAutoConnect(String password) {
   config.apid = "BonsaiAIO";
   config.psk = password;
   config.retainPortal = false;
-  config.autoReconnect = true;
   config.hostName = "BonsaiAIO";
   config.title = "BonsaiAIO";
   config.ticker = true;
   config.tickerPort = LED_PIN;
   config.tickerOn = HIGH;
+  config.boundaryOffset = CREDENTIAL_OFFSET;
 }
 
 void initDHT(void) {
@@ -574,8 +623,9 @@ void lcdPrintWaterLevel(void) {
 #endif
     lcd.setCursor(8, 0);
     lcd.print(F("        "));
-    if (waterLevelValues.waterValue <= 30) {
-      digitalWrite(LED_PIN, HIGH);
+    if (waterLevelValues.waterValue <= options.warningLedPercentage) {
+      if (options.ledEnabled)
+        digitalWrite(LED_PIN, HIGH);
       lcd.setCursor(8, 0);
       lcd.print(F("!"));
       lcd.write(WATER_LEVEL_EMPTY.id);
@@ -675,8 +725,157 @@ void lcdPrintWiFiIP(void) {
 }
 
 void rootPage(void) {
-  char content[] = "<a href=\"/_ac\">Click here to go to configuration</a>";
-  Server.send(200, "text/html", content);
+  /*char content[] = "<a href=\"/_ac\">Click here to go to configuration</a>";
+  Server.send(200, "text/html", content);*/
+  /*String page = PSTR(
+"<html>"
+"<head>"
+  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+  "<style type=\"text/css\">"
+    "body {"
+    "-webkit-appearance:none;"
+    "-moz-appearance:none;"
+    "font-family:'Arial',sans-serif;"
+    "text-align:left;"
+    "}"
+    ".menu > a:link {"
+    "position: absolute;"
+    "display: inline-block;"
+    "right: 12px;"
+    "padding: 0 6px;"
+    "text-decoration: none;"
+    "}"
+    ".button {"
+    "display:inline-block;"
+    "border-radius:7px;"
+    "background:#73ad21;"
+    "margin:0 10px 0 10px;"
+    "padding:10px 20px 10px 20px;"
+    "text-decoration:none;"
+    "color:#000000;"
+    "}"
+  "</style>"
+"</head>"
+"<body>"
+  "<div class=\"menu\">" AUTOCONNECT_LINK(BAR_24) "</div>"
+  "<h1>BonsaiAIO settings</h1>"
+  "Warning LED<br>"
+  "GPIO(");
+  page += String(LED_PIN);
+  page += String(F(") : <span style=\"font-weight:bold;color:"));
+  page += options.ledEnabled ? String("Tomato\">Enabled") : String("SlateBlue\">Disabled");
+  page += String(F("</span>"));
+  page += String(F("<p><a class=\"button\" href=\"/io?v=disable\">Disable</a><a class=\"button\" href=\"/io?v=enable\">Enable</a></p>"));
+  page += String(F("<p><form action=\"/io\" method=\"get\"><label>Temperature fix</label><br /><input type=\"number\" placeholder=\"0.00\" value=\""));
+  page += String(options.temperatureFix);
+  page += String(F("\" step=\"0.1\" name=\"temp\"></p>"));
+  page += String(F("<p><input type=\"submit\" value=\"Set fix\" name=\"Set\" /></p></form>"));
+  page += String(F("<p><form action=\"/io\" method=\"get\"><label>Warning LED turns on at percentage: </label><br />"));
+  page += String(F("<input type=\"number\" placeholder=\"100\" value=\""));
+  page += String(options.warningLedPercentage);
+  page += String(F("\" step=\"1\" name=\"perc\"></p>"));
+  page += String(F("<p><input type=\"submit\" value=\"Set percentage\" name=\"Set\" /></p></form>"));
+  page += String(F("<p><a class=\"button\" href=\"/_ac\">Go to WiFi settings</a></p>"));
+  page += String(F("<p><form action=\"/io\" method=\"get\"><label>Display change time (seconds): </label><br />"));
+  page += String(F("<input type=\"number\" placeholder=\"100\" value=\""));
+  page += String(waitingTimes.displayTaskSeconds);
+  page += String(F("\" step=\"1\" name=\"secs\" min=\"0\"></p>"));
+  page += String(F("<p><input type=\"submit\" value=\"Set time interval\" name=\"Set\" /></p></form>"));
+  page += String(F("<p><a class=\"button\" href=\"/_ac\">Go to WiFi settings</a></p>"));
+  page += String(F("</body></html>"));*/
+  String page = html;
+  String pageBody = body;
+  String bodyOptions = setupOptions;
+
+  bodyOptions.replace("{MENU}", cogMenu);
+  bodyOptions.replace("{LED_STATUS}", (options.ledEnabled ? String(F("Tomato\">Enabled")) : String(F("SlateBlue\">Disabled"))));
+  bodyOptions.replace("{WLVL_TIME}", String(waitingTimes.waterLevelSensor));
+  bodyOptions.replace("{TEMP_HUMD_TIME}", String((waitingTimes.tempHumdSensor / 1000)));
+  bodyOptions.replace("{LED_PERCENTAGE}", String(options.warningLedPercentage));
+  bodyOptions.replace("{DISPLAY_SECONDS}", String(waitingTimes.displayTaskSeconds));
+  bodyOptions.replace("{TEMP_FIX}", String(options.temperatureFix));
+
+  pageBody.replace("{BODY}", bodyOptions);
+
+  page.replace("{HEAD}", head);
+  page.replace("{BODY}", pageBody);
+  
+  Server.send(200, "text/html", page);
+}
+
+void handleGPIO(void) {
+  WebServerClass& server = Portal.host();
+  bool hasAnyValueChanged = false;
+  if (server.arg("v") == "disable") {
+    if (options.ledEnabled) {
+      options.ledEnabled = false;
+      digitalWrite(LED_PIN, LOW);
+      EEPROM.put(options.ledEnabledAddress, options.ledEnabled);
+      hasAnyValueChanged = true;
+    }
+  }
+  else if (server.arg("v") == "enable") {
+    if (!options.ledEnabled) {
+      options.ledEnabled = true;
+      EEPROM.put(options.ledEnabledAddress, options.ledEnabled);
+      hasAnyValueChanged = true;
+    }
+  }
+  if (server.arg("wlvl") != "") {
+    int waterLevelTime = atoi(server.arg("wlvl").c_str());
+    if (waterLevelTime != waitingTimes.waterLevelSensor) {
+      waitingTimes.waterLevelSensor = waterLevelTime;
+      EEPROM.put(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
+      hasAnyValueChanged = true;
+      timers.waterSensor.detach();
+      timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
+    }
+  }
+  if (server.arg("dht") != "") {
+    int tempHumdTime = (atoi(server.arg("dht").c_str()) * 1000);
+    if (tempHumdTime != waitingTimes.tempHumdSensor) {
+      waitingTimes.tempHumdSensor = tempHumdTime;
+      EEPROM.put(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
+      hasAnyValueChanged = true;
+      timers.dhtSensor.deleteTimer(dhtId);
+      dhtId = timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
+    }
+  }
+  if (server.arg("temp") != "") {
+    float fixedTemperature = atof(server.arg("temp").c_str());
+    if (fixedTemperature != options.temperatureFix) {
+      options.temperatureFix = fixedTemperature;
+      EEPROM.put(options.tempFixAddress, options.temperatureFix);
+      hasAnyValueChanged = true;
+    }
+  }
+  if (server.arg("perc") != "") {
+    int percentage = atoi(server.arg("perc").c_str());
+    if (percentage != options.warningLedPercentage) {
+      options.warningLedPercentage = percentage;
+      EEPROM.put(options.warningLedPercentageAddress, (int) options.warningLedPercentage);
+      hasAnyValueChanged = true;
+    }
+  }
+  if (server.arg("secs") != "") {
+    int seconds = atoi(server.arg("secs").c_str());
+    if (seconds != waitingTimes.displayTaskSeconds) {
+      waitingTimes.displayTaskSeconds = seconds;
+      EEPROM.put(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
+      hasAnyValueChanged = true;
+      timers.displayTask.detach();
+      timers.displayTask.attach(waitingTimes.displayTaskSeconds, changeDisplayMode);
+    }
+  }
+  if (hasAnyValueChanged)
+    EEPROM.commit();
+  sendRedirect("/");
+}
+
+void sendRedirect(String uri) {
+  Server.sendHeader("Location", uri, true);
+  Server.send(302, "text/plain", "");
+  Server.client().stop();
 }
 
 String generateRandomString(void) {
@@ -780,7 +979,7 @@ void updateDHTInfo(void) {
     Serial.printf("No fixed temp: %.2f\n", event.temperature);
 #endif
     if (event.temperature != dhtValues.latestTemperature) {
-      dhtValues.latestTemperature = (event.temperature + TEMPERATURE_FIX);
+      dhtValues.latestTemperature = (event.temperature + options.temperatureFix);
       dhtValues.hasTempChanged = true;
     }
   }
@@ -930,10 +1129,6 @@ void setupClock(void) {
   setupLatitudeLongitude();
   getTimezoneOffset();
   ntp.setTimeOffset(geolocationInformation.offset);
-}
-
-void launchDisplayTask(void) {
-  tasks.displayTask.run();
 }
 
 void publishWiFiStrength(void) {
