@@ -17,6 +17,7 @@ extern "C" {
 #include <ESP8266WebServer.h>
 #include <AutoConnect.h>
 #include <AutoConnectCredential.h>
+#include <AutoConnectAux.h>
 
 // Components specific libraries
 #include <LiquidCrystal595.h>
@@ -725,64 +726,6 @@ void lcdPrintWiFiIP(void) {
 }
 
 void rootPage(void) {
-  /*char content[] = "<a href=\"/_ac\">Click here to go to configuration</a>";
-  Server.send(200, "text/html", content);*/
-  /*String page = PSTR(
-"<html>"
-"<head>"
-  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-  "<style type=\"text/css\">"
-    "body {"
-    "-webkit-appearance:none;"
-    "-moz-appearance:none;"
-    "font-family:'Arial',sans-serif;"
-    "text-align:left;"
-    "}"
-    ".menu > a:link {"
-    "position: absolute;"
-    "display: inline-block;"
-    "right: 12px;"
-    "padding: 0 6px;"
-    "text-decoration: none;"
-    "}"
-    ".button {"
-    "display:inline-block;"
-    "border-radius:7px;"
-    "background:#73ad21;"
-    "margin:0 10px 0 10px;"
-    "padding:10px 20px 10px 20px;"
-    "text-decoration:none;"
-    "color:#000000;"
-    "}"
-  "</style>"
-"</head>"
-"<body>"
-  "<div class=\"menu\">" AUTOCONNECT_LINK(BAR_24) "</div>"
-  "<h1>BonsaiAIO settings</h1>"
-  "Warning LED<br>"
-  "GPIO(");
-  page += String(LED_PIN);
-  page += String(F(") : <span style=\"font-weight:bold;color:"));
-  page += options.ledEnabled ? String("Tomato\">Enabled") : String("SlateBlue\">Disabled");
-  page += String(F("</span>"));
-  page += String(F("<p><a class=\"button\" href=\"/io?v=disable\">Disable</a><a class=\"button\" href=\"/io?v=enable\">Enable</a></p>"));
-  page += String(F("<p><form action=\"/io\" method=\"get\"><label>Temperature fix</label><br /><input type=\"number\" placeholder=\"0.00\" value=\""));
-  page += String(options.temperatureFix);
-  page += String(F("\" step=\"0.1\" name=\"temp\"></p>"));
-  page += String(F("<p><input type=\"submit\" value=\"Set fix\" name=\"Set\" /></p></form>"));
-  page += String(F("<p><form action=\"/io\" method=\"get\"><label>Warning LED turns on at percentage: </label><br />"));
-  page += String(F("<input type=\"number\" placeholder=\"100\" value=\""));
-  page += String(options.warningLedPercentage);
-  page += String(F("\" step=\"1\" name=\"perc\"></p>"));
-  page += String(F("<p><input type=\"submit\" value=\"Set percentage\" name=\"Set\" /></p></form>"));
-  page += String(F("<p><a class=\"button\" href=\"/_ac\">Go to WiFi settings</a></p>"));
-  page += String(F("<p><form action=\"/io\" method=\"get\"><label>Display change time (seconds): </label><br />"));
-  page += String(F("<input type=\"number\" placeholder=\"100\" value=\""));
-  page += String(waitingTimes.displayTaskSeconds);
-  page += String(F("\" step=\"1\" name=\"secs\" min=\"0\"></p>"));
-  page += String(F("<p><input type=\"submit\" value=\"Set time interval\" name=\"Set\" /></p></form>"));
-  page += String(F("<p><a class=\"button\" href=\"/_ac\">Go to WiFi settings</a></p>"));
-  page += String(F("</body></html>"));*/
   String page = html;
   String pageBody = body;
   String bodyOptions = setupOptions;
