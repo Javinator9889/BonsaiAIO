@@ -6,18 +6,13 @@
 */
 
 // Web control & WiFi libraries
-extern "C" {
-  #include "user_interface.h"
-}
+#include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WiFiMulti.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
-#include <AutoConnect.h>
-#include <AutoConnectCredential.h>
-#include <AutoConnectAux.h>
 
 // Components specific libraries
 #include <LiquidCrystal595.h>
@@ -35,6 +30,39 @@ extern "C" {
 #include <WiFiUdp.h>
 #include <ThingSpeak.h>
 #include <Time.h>
+
+// EEPROM WiFi storage struct
+extern "C" {
+#include "user_interface.h"
+}
+
+// Define whether the DEVMODE is active
+// for saving sketch size - set to 0 for
+// disabling
+#define DEVMODE     0
+// VVV - extra verbosity
+#define VVV         0
+// Enable or disable OTAs - disabled due to space
+// restrictions
+#define OTA_ENABLED 1
+
+#if DEVMODE
+#define PRINT_DEBUG_MESSAGES
+#else
+#undef AC_DEBUG
+#endif
+
+#if OTA_ENABLED
+#ifdef AUTOCONNECT_USE_UPDATE
+#undef AUTOCONNECT_USE_UPDATE
+#endif
+#include <ESP8266httpUpdate.h>
+#endif
+
+// AutoConnect libraries - must be defined here for OTA compatibility
+#include <AutoConnect.h>
+#include <AutoConnectCredential.h>
+#include <AutoConnectAux.h>
 
 // ThingSpeak publisher class
 #include "ThingSpeakPublisher.h"
@@ -54,26 +82,6 @@ extern "C" {
 // HTML pages
 #include "CustomHTML.h"
 
-// Define whether the DEVMODE is active
-// for saving sketch size - set to 0 for
-// disabling
-#define DEVMODE     0
-// VVV - extra verbosity
-#define VVV         0
-// Enable or disable OTAs - disabled due to space
-// restrictions
-#define OTA_ENABLED 1
-
-#if DEVMODE
-#define PRINT_DEBUG_MESSAGES
-#else
-#undef AC_DEBUG
-#endif
-
-#if OTA_ENABLED
-#include <ESP8266httpUpdate.h>
-#endif
-
 // Strings & URLs that will be used
 #define TIMEZONE_DB_URL   "http://api.timezonedb.com/v2.1/get-time-zone?key=%s&format=json&by=position&lat=%s&lng=%s"
 #define EXTREME_IP_URL    "http://extreme-ip-lookup.com/json/"
@@ -90,7 +98,6 @@ extern "C" {
 // Other "define" constants
 #define NTP_SERVER  "pool.ntp.org"
 #define DHT_TYPE    DHT11
-#define DHT_PIN     D1
 #define CLEAR_ROW   "                "
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
@@ -118,6 +125,8 @@ const struct {
 } LCD_PINS = {D6, D7, D8};
 
 const uint8_t LED_PIN = D0;
+const uint8_t DHT_PIN = D1;
+const uint8_t MOISTURE_ENABLE_PIN = D5;
 const uint8_t WATER_LEVEL_DATA_PIN = A0;
 const uint8_t COLUMNS = 16;
 const uint8_t ROWS = 2;
@@ -141,6 +150,7 @@ bool printed = false;
 // application data
 struct {
   uint16_t waterLevelSensor;
+  uint16_t waterLevelOnTimer;
   uint16_t tempHumdSensor;
   uint32_t offsetSeconds;
   uint32_t wifiTaskSeconds;
@@ -155,6 +165,7 @@ struct {
   uint16_t wifiStatusTask;
 } waitingTimes = {
   60,       // 60 seconds
+  50,       // 50 seconds
   9000,     // 09 seconds
   1800 ,    // 30 minutes
   660,      // 11 minutes
@@ -171,6 +182,7 @@ struct {
 
 struct {
   SimpleTimer dhtSensor;
+  SimpleTimer wlvlOnTimer;
   Ticker waterSensor;
   Ticker updateStatistics;
   Ticker displayTask;
@@ -227,12 +239,13 @@ struct {
   int   displayTaskSecsAddress;
   int   waterLevelTimeAddress;
   int   tempHumdTimeAddress;
-} options = {0.0f, true, 30, sizeof(short), 
-                             (sizeof(short) + sizeof(float)),
-                             (sizeof(short) + sizeof(float) + sizeof(bool)),
-                             (sizeof(short) + sizeof(float) + sizeof(bool) + sizeof(int)),
-                             (sizeof(short) + sizeof(float) + sizeof(bool) + (2 * sizeof(int))),
-                             (sizeof(short) + sizeof(float) + sizeof(bool) + (3 * sizeof(int)))};
+} options = {0.0f, true, 30, sizeof(short),
+             (sizeof(short) + sizeof(float)),
+             (sizeof(short) + sizeof(float) + sizeof(bool)),
+             (sizeof(short) + sizeof(float) + sizeof(bool) + sizeof(int)),
+             (sizeof(short) + sizeof(float) + sizeof(bool) + (2 * sizeof(int))),
+             (sizeof(short) + sizeof(float) + sizeof(bool) + (3 * sizeof(int)))
+            };
 
 
 // MQTT information
@@ -266,6 +279,7 @@ long latestRSSI = 0;
 bool portalExecuted = false;
 unsigned long wifiExecutionTime = 0L;
 int dhtId;
+int waterSensorTimerId;
 
 // Define the functions that will be
 // available
@@ -274,6 +288,10 @@ void initAutoConnect(String password);
 void initDHT(void);
 void createLCDCustomCharacters(void);
 void substituteBonsaiChar(void);
+bool digitalReadOutputPinState(uint8_t pin);
+void powerOnSensor(uint8_t ePin);
+void powerOffSensor(uint8_t ePin);
+void turnOnWaterLevelSensor(void);
 void lcdPrintTime(void);
 void lcdPrintDHT(void);
 void lcdPrintWaterLevel(void);
@@ -332,6 +350,9 @@ void setup(void) {
   lcd.clear();
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
+  pinMode(MOISTURE_ENABLE_PIN, OUTPUT);
+  turnOnWaterLevelSensor();
+
   initDHT();
   createLCDCustomCharacters();
 
@@ -342,7 +363,7 @@ void setup(void) {
   delay(2000);
   lcd.setCursor(0, 1);
   lcd.print(F("Initializing..."));
-  
+
   initEEPROM();
   password = generateRandomString();
   initAutoConnect(password);
@@ -415,6 +436,7 @@ void setup(void) {
   timers.ota.setInterval(waitingTimes.otaCheckMs, lookForOTAUpdates);
 #endif
   dhtId = timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
+  waterSensorTimerId = timers.wlvlOnTimer.setInterval(waitingTimes.waterLevelOnTimer, turnOnWaterLevelSensor);
   timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
   timers.offsetControl.setInterval(waitingTimes.offsetSeconds * 1000, setupClock);
   timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
@@ -443,12 +465,13 @@ void loop(void) {
   timers.wifiStatusTask.run();
   timers.offsetControl.run();
   updateTime();
+  timers.wlvlOnTimer.run();
   timers.dhtSensor.run();
 #if OTA_ENABLED
   timers.ota.run();
 #endif
   Portal.handleClient();
-  switch((uint8_t) displayMode) {
+  switch ((uint8_t) displayMode) {
     case DEFAULT_MODE:
       lcdPrintTime();
       lcdPrintWaterLevel();
@@ -507,6 +530,7 @@ void initEEPROM(void) {
     EEPROM.get(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
     EEPROM.get(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
     EEPROM.get(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
+    waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor * 1000) - 2000;
   }
 }
 
@@ -568,6 +592,24 @@ void substituteBonsaiChar(void) {
   lcd.createChar(WATER_LEVEL_50.id, WATER_LEVEL_50.icon);
 }
 
+void powerOnSensor(uint8_t ePin) {
+#if DEVMODE
+  Serial.printf("Turning on sensor at pin: %i\n", ePin);
+#endif
+  digitalWrite(ePin, HIGH);
+}
+
+void powerOffSensor(uint8_t ePin) {
+#if DEVMODE
+  Serial.printf("Turning off sensor at pin: %i\n", ePin);
+#endif
+  digitalWrite(ePin, LOW);
+}
+
+void turnOnWaterLevelSensor(void) {
+  powerOnSensor(MOISTURE_ENABLE_PIN);
+}
+
 void lcdPrintTime(void) {
   if (dataTime.hasTimeChanged || displayModeChanged) {
 #if DEVMODE
@@ -612,7 +654,7 @@ void lcdPrintDHT(void) {
       dhtValues.hasHumdChanged = false;
   }
   if (displayModeChanged)
-      displayModeChanged = false;
+    displayModeChanged = false;
 }
 
 void lcdPrintWaterLevel(void) {
@@ -682,7 +724,7 @@ void lcdPrintAvgDHT(void) {
     lcd.print(humdStats.getMean(), 0);
     lcd.print(F("%"));
     displayModeChanged = false;
-  }      
+  }
 }
 
 void lcdPrintWiFiInformation(void) {
@@ -742,7 +784,7 @@ void rootPage(void) {
 
   page.replace("{HEAD}", head);
   page.replace("{BODY}", pageBody);
-  
+
   Server.send(200, "text/html", page);
 }
 
@@ -770,8 +812,11 @@ void handleGPIO(void) {
       waitingTimes.waterLevelSensor = waterLevelTime;
       EEPROM.put(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
       hasAnyValueChanged = true;
+      waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor * 1000) - 2000;
       timers.waterSensor.detach();
+      timers.wlvlOnTimer.deleteTimer(waterSensorTimerId);
       timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
+      waterSensorTimerId = timers.wlvlOnTimer.setInterval(waitingTimes.waterLevelOnTimer, turnOnWaterLevelSensor);
     }
   }
   if (server.arg("dht") != "") {
@@ -909,15 +954,24 @@ void updateDHTInfo(void) {
 #endif
   sensors_event_t event;
   dht.temperature().getEvent(&event);
-  if (isnan(event.temperature)) {
+  uint8_t tempAttemps = 0;
 #if DEVMODE
+  if (isnan(event.temperature)) {
     Serial.println(F("Error reading temperature!"));
-#endif
+    Serial.println(F("Retrying..."));
   }
-  else {
+#endif
+  while (isnan(event.temperature) && (++tempAttemps <= 100)) {
+    dht.temperature().getEvent(&event);
+    delay(10);
+  }
+#if DEVMODE
+  Serial.printf("Temperature attemps: %i\n", tempAttemps);
+#endif
+  if (!isnan(event.temperature)) {
 #if DEVMODE
     Serial.print(F("Temperature: "));
-    Serial.print(event.temperature + TEMPERATURE_FIX);
+    Serial.print(event.temperature + options.temperatureFix);
     Serial.println(F("°C"));
     Serial.printf("No fixed temp: %.2f\n", event.temperature);
 #endif
@@ -928,12 +982,21 @@ void updateDHTInfo(void) {
   }
   // Get humidity event and print its value.
   dht.humidity().getEvent(&event);
-  if (isnan(event.relative_humidity)) {
+  uint8_t humdAttemps = 0;
 #if DEVMODE
+  if (isnan(event.relative_humidity)) {
     Serial.println(F("Error reading humidity!"));
-#endif
+    Serial.println(F("Retrying..."));
   }
-  else {
+#endif
+  while (isnan(event.relative_humidity) && (++humdAttemps <= 100)) {
+    dht.humidity().getEvent(&event);
+    delay(10);
+  }
+#if DEVMODE
+  Serial.printf("Humidity attemps: %i\n", humdAttemps);
+#endif
+  if (!isnan(event.relative_humidity)) {
 #if VVV
     Serial.print(F("Humidity: "));
     Serial.print(event.relative_humidity);
@@ -954,7 +1017,7 @@ void updateWaterLevelInfo(void) {
   executionTimes.latestWaterExecution = currentTime;
 #endif
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
-  uint8_t percentageWaterValue = map(currentWaterValue, waterLevelValues.upperLimit, 
+  uint8_t percentageWaterValue = map(currentWaterValue, waterLevelValues.upperLimit,
                                      waterLevelValues.lowerLimit, 0, 100);
   if (percentageWaterValue > 100)
     percentageWaterValue = 100;
@@ -962,6 +1025,7 @@ void updateWaterLevelInfo(void) {
     waterLevelValues.waterValue = percentageWaterValue;
     waterLevelValues.hasWaterValueChanged = true;
   }
+  powerOffSensor(MOISTURE_ENABLE_PIN);
 }
 
 bool areTimesDifferent(String time1, String time2) {
@@ -980,17 +1044,17 @@ bool areTimesDifferent(String time1, String time2) {
     return false;
 }
 
-uint8_t toWiFiQuality(int32_t rssi) { 
-    unsigned int qu; 
-    if (rssi == 31) // WiFi signal is weak and RSSI value is unreliable. 
-        qu = 0; 
-    else if (rssi <= -100) 
-        qu = 0; 
-    else if (rssi >= -50) 
-        qu = 100; 
-    else 
-        qu = 2 * (rssi + 100); 
-    return qu;
+uint8_t toWiFiQuality(int32_t rssi) {
+  unsigned int qu;
+  if (rssi == 31) // WiFi signal is weak and RSSI value is unreliable.
+    qu = 0;
+  else if (rssi <= -100)
+    qu = 0;
+  else if (rssi >= -50)
+    qu = 100;
+  else
+    qu = 2 * (rssi + 100);
+  return qu;
 }
 
 void setupLatitudeLongitude(void) {
@@ -1129,7 +1193,7 @@ void publishHumidity(void) {
 void publishWaterLevel(void) {
   if (WiFi.status() == WL_CONNECTED) {
     int httpCode = mqttWlvl.publish(waterLevelValues.waterValue);
-#if DEVMODE    
+#if DEVMODE
     if (httpCode == 200) {
       Serial.println("Correctly published Water Value");
     } else {
@@ -1146,8 +1210,8 @@ void publishWaterLevel(void) {
 void statisticsUpdate(void) {
 #if DEVMODE
   Serial.println("Updating statistics");
-  Serial.printf("Latest temperature: %f | Latest humidity: %d\n", 
-                dhtValues.latestTemperature, dhtValues.latestHumidity);  
+  Serial.printf("Latest temperature: %f | Latest humidity: %d\n",
+                dhtValues.latestTemperature, dhtValues.latestHumidity);
 #endif
   tempStats.add(dhtValues.latestTemperature);
   humdStats.add(dhtValues.latestHumidity);
