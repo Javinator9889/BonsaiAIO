@@ -288,7 +288,6 @@ void initAutoConnect(String password);
 void initDHT(void);
 void createLCDCustomCharacters(void);
 void substituteBonsaiChar(void);
-bool digitalReadOutputPinState(uint8_t pin);
 void powerOnSensor(uint8_t ePin);
 void powerOffSensor(uint8_t ePin);
 void turnOnWaterLevelSensor(void);
