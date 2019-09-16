@@ -13,6 +13,7 @@
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <ESP8266WebServer.h>
+#include <AutoConnectDefs.h>
 
 // Components specific libraries
 #include <LiquidCrystal595.h>
@@ -56,13 +57,16 @@ extern "C" {
 #ifdef AUTOCONNECT_USE_UPDATE
 #undef AUTOCONNECT_USE_UPDATE
 #endif
-#include <ESP8266httpUpdate.h>
 #endif
 
 // AutoConnect libraries - must be defined here for OTA compatibility
 #include <AutoConnect.h>
 #include <AutoConnectCredential.h>
 #include <AutoConnectAux.h>
+
+#if OTA_ENABLED
+#include <ESP8266httpUpdate.h>
+#endif
 
 // ThingSpeak publisher class
 #include "ThingSpeakPublisher.h"
@@ -164,8 +168,8 @@ struct {
   uint16_t clockSyncInterval;
   uint16_t wifiStatusTask;
 } waitingTimes = {
-  60,       // 60 seconds
-  50,       // 50 seconds
+  60000,    // 60 seconds
+  50000,    // 50 seconds
   9000,     // 09 seconds
   1800 ,    // 30 minutes
   660,      // 11 minutes
@@ -183,7 +187,7 @@ struct {
 struct {
   SimpleTimer dhtSensor;
   SimpleTimer wlvlOnTimer;
-  Ticker waterSensor;
+  SimpleTimer waterSensor;
   Ticker updateStatistics;
   Ticker displayTask;
   Ticker clearStatsTask;
@@ -280,6 +284,7 @@ bool portalExecuted = false;
 unsigned long wifiExecutionTime = 0L;
 int dhtId;
 int waterSensorTimerId;
+int waterLevelTimerId;
 
 // Define the functions that will be
 // available
@@ -436,7 +441,7 @@ void setup(void) {
 #endif
   dhtId = timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   waterSensorTimerId = timers.wlvlOnTimer.setInterval(waitingTimes.waterLevelOnTimer, turnOnWaterLevelSensor);
-  timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
+  waterLevelTimerId = timers.waterSensor.setInterval(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
   timers.offsetControl.setInterval(waitingTimes.offsetSeconds * 1000, setupClock);
   timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
   timers.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000, publishTemperature);
@@ -465,6 +470,7 @@ void loop(void) {
   timers.offsetControl.run();
   updateTime();
   timers.wlvlOnTimer.run();
+  timers.waterSensor.run();
   timers.dhtSensor.run();
 #if OTA_ENABLED
   timers.ota.run();
@@ -529,7 +535,7 @@ void initEEPROM(void) {
     EEPROM.get(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
     EEPROM.get(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
     EEPROM.get(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
-    waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor * 1000) - 2000;
+    waitingTimes.waterLevelOnTimer = waitingTimes.waterLevelSensor - 10000;
   }
 }
 
@@ -773,7 +779,7 @@ void rootPage(void) {
 
   bodyOptions.replace("{MENU}", cogMenu);
   bodyOptions.replace("{LED_STATUS}", (options.ledEnabled ? String(F("Tomato\">Enabled")) : String(F("SlateBlue\">Disabled"))));
-  bodyOptions.replace("{WLVL_TIME}", String(waitingTimes.waterLevelSensor));
+  bodyOptions.replace("{WLVL_TIME}", String((waitingTimes.waterLevelSensor / 1000)));
   bodyOptions.replace("{TEMP_HUMD_TIME}", String((waitingTimes.tempHumdSensor / 1000)));
   bodyOptions.replace("{LED_PERCENTAGE}", String(options.warningLedPercentage));
   bodyOptions.replace("{DISPLAY_SECONDS}", String(waitingTimes.displayTaskSeconds));
@@ -806,21 +812,21 @@ void handleGPIO(void) {
     }
   }
   if (server.arg("wlvl") != "") {
-    int waterLevelTime = atoi(server.arg("wlvl").c_str());
-    if (waterLevelTime != waitingTimes.waterLevelSensor) {
+    int waterLevelTime = (atoi(server.arg("wlvl").c_str()) * 1000);
+    if ((waterLevelTime != waitingTimes.waterLevelSensor) && (waterLevelTime >= 11000)) {
       waitingTimes.waterLevelSensor = waterLevelTime;
       EEPROM.put(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
       hasAnyValueChanged = true;
-      waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor * 1000) - 2000;
-      timers.waterSensor.detach();
+      waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor - 10000);
+      timers.waterSensor.deleteTimer(waterLevelTimerId);
       timers.wlvlOnTimer.deleteTimer(waterSensorTimerId);
-      timers.waterSensor.attach(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
       waterSensorTimerId = timers.wlvlOnTimer.setInterval(waitingTimes.waterLevelOnTimer, turnOnWaterLevelSensor);
+      waterLevelTimerId = timers.waterSensor.setInterval(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
     }
   }
   if (server.arg("dht") != "") {
     int tempHumdTime = (atoi(server.arg("dht").c_str()) * 1000);
-    if (tempHumdTime != waitingTimes.tempHumdSensor) {
+    if ((tempHumdTime != waitingTimes.tempHumdSensor) && (tempHumdTime >= 3000)) {
       waitingTimes.tempHumdSensor = tempHumdTime;
       EEPROM.put(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
       hasAnyValueChanged = true;
@@ -838,7 +844,7 @@ void handleGPIO(void) {
   }
   if (server.arg("perc") != "") {
     int percentage = atoi(server.arg("perc").c_str());
-    if (percentage != options.warningLedPercentage) {
+    if ((percentage != options.warningLedPercentage) && (percentage >= 0)) {
       options.warningLedPercentage = percentage;
       EEPROM.put(options.warningLedPercentageAddress, (int) options.warningLedPercentage);
       hasAnyValueChanged = true;
@@ -846,7 +852,7 @@ void handleGPIO(void) {
   }
   if (server.arg("secs") != "") {
     int seconds = atoi(server.arg("secs").c_str());
-    if (seconds != waitingTimes.displayTaskSeconds) {
+    if ((seconds != waitingTimes.displayTaskSeconds) && (seconds >= 5)) {
       waitingTimes.displayTaskSeconds = seconds;
       EEPROM.put(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
       hasAnyValueChanged = true;

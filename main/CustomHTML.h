@@ -66,7 +66,7 @@ const String setupOptions =
             "<h2>Sensor options</h2>"
             "<h5>Elapsed time between measurements (seconds)</h5>"
             "<label>Water level sensor</label><br />"
-            "<p><input type=\"number\" placeholder=\"Elapsed time...\" value=\"{WLVL_TIME}\" step=\"1\" min=\"3\" name=\"wlvl\"></p>"
+            "<p><input type=\"number\" placeholder=\"Elapsed time...\" value=\"{WLVL_TIME}\" step=\"1\" min=\"11\" name=\"wlvl\"></p>"
             "<label>Temperature & humidity sensor</label><br />"
             "<p><input type=\"number\" placeholder=\"Elapsed time...\" value=\"{TEMP_HUMD_TIME}\" step=\"1\" min=\"3\" name=\"dht\"></p>"
             "<h2>Other options</h2>"
