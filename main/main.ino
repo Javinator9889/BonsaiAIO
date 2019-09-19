@@ -46,6 +46,8 @@ extern "C" {
 // Enable or disable OTAs - disabled due to space
 // restrictions
 #define OTA_ENABLED 1
+// Enable remote logging
+#define SYSLOG      0
 
 #if DEVMODE
 #define PRINT_DEBUG_MESSAGES
@@ -66,6 +68,14 @@ extern "C" {
 
 #if OTA_ENABLED
 #include <ESP8266httpUpdate.h>
+#endif
+
+#if SYSLOG
+#include <Syslog.h>
+#define SYSLOG_SERVER    "192.168.1.88"
+#define SYSLOG_PORT      514
+#define DEVICE_HOSTNAME "ESP8266"
+#define APP_NAME        "BonsaiAIO"
 #endif
 
 // ThingSpeak publisher class
@@ -106,8 +116,8 @@ extern "C" {
 #define UPPER_LIMIT 250
 #define LOWER_LIMIT 120
 #define EEPROM_SIZE 4096
-#define EEPROM_CRCI 0x001
-#define CREDENTIAL_OFFSET (sizeof(float) + sizeof(bool) + sizeof(short) + (4 * sizeof(int)))
+#define EEPROM_CRCI 0x010
+#define CREDENTIAL_OFFSET (sizeof(float) + sizeof(bool) + sizeof(short) + (2 * sizeof(long)) + (2 * sizeof(int)))
 
 // Web control objects
 WiFiClient client;
@@ -120,6 +130,10 @@ ESP8266WiFiMulti      wifiMulti;
 // Time components
 WiFiUDP ntpUDP;
 NTPClient ntp(ntpUDP, NTP_SERVER);
+
+#if SYSLOG
+Syslog syslog(ntpUDP, SYSLOG_SERVER, SYSLOG_PORT, DEVICE_HOSTNAME, APP_NAME, LOG_KERN);
+#endif
 
 // Components pins
 const struct {
@@ -153,9 +167,9 @@ bool printed = false;
 // Constant structs that contains
 // application data
 struct {
-  uint16_t waterLevelSensor;
+  long     waterLevelSensor;
   uint16_t waterLevelOnTimer;
-  uint16_t tempHumdSensor;
+  long     tempHumdSensor;
   uint32_t offsetSeconds;
   uint32_t wifiTaskSeconds;
   uint32_t tempTaskSeconds;
@@ -214,7 +228,7 @@ struct {
   bool hasWaterValueChanged;
   uint16_t lowerLimit;
   uint16_t upperLimit;
-} waterLevelValues = {0, true, 450, 900};
+} waterLevelValues = {0, true, 250, 900};
 
 struct {
   String formattedTime;
@@ -248,7 +262,7 @@ struct {
              (sizeof(short) + sizeof(float) + sizeof(bool)),
              (sizeof(short) + sizeof(float) + sizeof(bool) + sizeof(int)),
              (sizeof(short) + sizeof(float) + sizeof(bool) + (2 * sizeof(int))),
-             (sizeof(short) + sizeof(float) + sizeof(bool) + (3 * sizeof(int)))
+             (sizeof(short) + sizeof(float) + sizeof(bool) + sizeof(long) + (2 * sizeof(int)))
             };
 
 
@@ -355,7 +369,6 @@ void setup(void) {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
   pinMode(MOISTURE_ENABLE_PIN, OUTPUT);
-  turnOnWaterLevelSensor();
 
   initDHT();
   createLCDCustomCharacters();
@@ -372,7 +385,7 @@ void setup(void) {
   password = generateRandomString();
   initAutoConnect(password);
 #if DEVMODE
-  Serial.println(F("Starting web server and cautive portal"));
+  Serial.println(F("Starting web server and captive portal"));
   Serial.printf("AP SSID: BonsaiAIO\n\rAP password: %s\n\r", password.c_str());
 #endif
   // Start the web server and cautive portal
@@ -386,6 +399,9 @@ void setup(void) {
     Serial.println(F("Successfully connected to Internet!"));
     Serial.print(F("HTTP server:")); Serial.println(WiFi.localIP().toString());
 #endif
+#if SYSLOG
+    syslog.log(LOG_INFO, "WiFi connected! Starting remote logging");
+#endif
     lcd.clear();
     lcd.home();
     lcd.print(F("WiFi connected!"));
@@ -397,6 +413,7 @@ void setup(void) {
     Serial.println(F("Error connecting to Internet"));
 #endif
   }
+  turnOnWaterLevelSensor();
   lcd.clear();
   lcd.print(F("Getting time"));
   lcd.setCursor(0, 1);
@@ -462,6 +479,9 @@ void setup(void) {
   setupFinishedTime = millis();
   Serial.print(F("Setup elapsed time: "));
   Serial.println(setupFinishedTime);
+#endif
+#if SYSLOG
+  syslog.logf(LOG_INFO, "Finished setup. Elapsed time: %d", millis());
 #endif
 }
 
@@ -535,7 +555,7 @@ void initEEPROM(void) {
     EEPROM.get(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
     EEPROM.get(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
     EEPROM.get(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
-    waitingTimes.waterLevelOnTimer = waitingTimes.waterLevelSensor - 10000;
+    waitingTimes.waterLevelOnTimer = waitingTimes.waterLevelSensor - 1000;
   }
 }
 
@@ -601,12 +621,18 @@ void powerOnSensor(uint8_t ePin) {
 #if DEVMODE
   Serial.printf("Turning on sensor at pin: %i\n", ePin);
 #endif
+#if SYSLOG
+  syslog.logf(LOG_DEBUG, "Turning on sensor at pin: %i", ePin);
+#endif
   digitalWrite(ePin, HIGH);
 }
 
 void powerOffSensor(uint8_t ePin) {
 #if DEVMODE
   Serial.printf("Turning off sensor at pin: %i\n", ePin);
+#endif
+#if SYSLOG
+  syslog.logf(LOG_DEBUG, "Turning off sensor at pin: %i", ePin);
 #endif
   digitalWrite(ePin, LOW);
 }
@@ -812,12 +838,12 @@ void handleGPIO(void) {
     }
   }
   if (server.arg("wlvl") != "") {
-    int waterLevelTime = (atoi(server.arg("wlvl").c_str()) * 1000);
-    if ((waterLevelTime != waitingTimes.waterLevelSensor) && (waterLevelTime >= 11000)) {
+    long waterLevelTime = (atol(server.arg("wlvl").c_str()) * 1000);
+    if ((waterLevelTime != waitingTimes.waterLevelSensor) && (waterLevelTime >= 2000)) {
       waitingTimes.waterLevelSensor = waterLevelTime;
       EEPROM.put(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
       hasAnyValueChanged = true;
-      waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor - 10000);
+      waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor - 1000);
       timers.waterSensor.deleteTimer(waterLevelTimerId);
       timers.wlvlOnTimer.deleteTimer(waterSensorTimerId);
       waterSensorTimerId = timers.wlvlOnTimer.setInterval(waitingTimes.waterLevelOnTimer, turnOnWaterLevelSensor);
@@ -825,7 +851,7 @@ void handleGPIO(void) {
     }
   }
   if (server.arg("dht") != "") {
-    int tempHumdTime = (atoi(server.arg("dht").c_str()) * 1000);
+    int tempHumdTime = (atol(server.arg("dht").c_str()) * 1000);
     if ((tempHumdTime != waitingTimes.tempHumdSensor) && (tempHumdTime >= 3000)) {
       waitingTimes.tempHumdSensor = tempHumdTime;
       EEPROM.put(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
@@ -902,6 +928,9 @@ void changeDisplayMode(void) {
   displayModeChanged = true;
 #if DEVMODE
   Serial.printf("Changing display mode: %d\n", displayMode);
+#endif
+#if SYSLOG
+  syslog.logf(LOG_INFO, "Changing display mode: %d\n", displayMode);
 #endif
 }
 
@@ -980,6 +1009,9 @@ void updateDHTInfo(void) {
     Serial.println(F("°C"));
     Serial.printf("No fixed temp: %.2f\n", event.temperature);
 #endif
+#if SYSLOG
+    syslog.logf(LOG_DEBUG, "Temperature: %.2f ºC", event.temperature + options.temperatureFix);
+#endif
     if (event.temperature != dhtValues.latestTemperature) {
       dhtValues.latestTemperature = (event.temperature + options.temperatureFix);
       dhtValues.hasTempChanged = true;
@@ -1007,6 +1039,9 @@ void updateDHTInfo(void) {
     Serial.print(event.relative_humidity);
     Serial.println(F("%"));
 #endif
+#if SYSLOG
+    syslog.logf(LOG_DEBUG, "Humidity: %i%", event.relative_humidity);
+#endif
     if (event.relative_humidity != dhtValues.latestHumidity) {
       dhtValues.latestHumidity = event.relative_humidity;
       dhtValues.hasHumdChanged = true;
@@ -1018,12 +1053,20 @@ void updateWaterLevelInfo(void) {
 #if DEVMODE
   uint32_t currentTime = millis();
   uint32_t diff = currentTime - executionTimes.latestWaterExecution;
-  Serial.print(F("Latest water execution about ")); Serial.print(String(diff) + " ms. ago");
+  Serial.print(F("Latest water execution about ")); Serial.print(String(diff) + " ms. ago\n");
   executionTimes.latestWaterExecution = currentTime;
 #endif
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
   uint8_t percentageWaterValue = map(currentWaterValue, waterLevelValues.upperLimit,
                                      waterLevelValues.lowerLimit, 0, 100);
+#if SYSLOG
+  syslog.logf(LOG_DEBUG, "Water value (analog): %i | Percentage: %i%", currentWaterValue, 
+                                                                       percentageWaterValue);
+#endif
+#if DEVMODE
+  Serial.printf("Water value (analog): %i | Percentage: %i%\n", currentWaterValue, 
+                                                                percentageWaterValue);
+#endif
   if (percentageWaterValue > 100)
     percentageWaterValue = 100;
   if (percentageWaterValue != waterLevelValues.waterValue) {
@@ -1245,6 +1288,9 @@ void lookForOTAUpdates(void) {
   if (WiFi.status() == WL_CONNECTED) {
 #if DEVMODE
     Serial.println(F("Looking for OTAs..."));
+#endif
+#if SYSLOG
+    syslog.log(LOG_INFO, "Looking for OTAs...");
 #endif
     ESPhttpUpdate.setLedPin(LED_PIN, HIGH);
     t_httpUpdate_return returnValue = ESPhttpUpdate.update(client, OTA_URL, RUNNING_VERSION);
