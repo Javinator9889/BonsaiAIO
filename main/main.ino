@@ -34,7 +34,7 @@
 
 // EEPROM WiFi storage struct
 extern "C" {
-#include "user_interface.h"
+  #include "user_interface.h"
 }
 
 // Define whether the DEVMODE is active
@@ -47,7 +47,7 @@ extern "C" {
 // restrictions
 #define OTA_ENABLED 1
 // Enable remote logging
-#define SYSLOG      0
+#define SYSLOG      1
 
 #if DEVMODE
 #define PRINT_DEBUG_MESSAGES
@@ -72,8 +72,8 @@ extern "C" {
 
 #if SYSLOG
 #include <Syslog.h>
-#define SYSLOG_SERVER    "192.168.1.88"
-#define SYSLOG_PORT      514
+#define SYSLOG_SERVER   "192.168.1.88"
+#define SYSLOG_PORT     514
 #define DEVICE_HOSTNAME "ESP8266"
 #define APP_NAME        "BonsaiAIO"
 #endif
@@ -168,34 +168,34 @@ bool printed = false;
 // application data
 struct {
   long     waterLevelSensor;
-  uint16_t waterLevelOnTimer;
+  long     waterLevelOnTimer;
   long     tempHumdSensor;
-  uint32_t offsetSeconds;
-  uint32_t wifiTaskSeconds;
-  uint32_t tempTaskSeconds;
-  uint32_t humdTaskSeconds;
-  uint32_t wlvlTaskSeconds;
+  long     offsetSeconds;
+  long     wifiTaskSeconds;
+  long     tempTaskSeconds;
+  long     humdTaskSeconds;
+  long     wlvlTaskSeconds;
   uint32_t statisticsTaskSeconds;
   int      displayTaskSeconds;
-  uint16_t otaCheckMs;
+  long     otaCheckMs;
   uint32_t clearStatsSeconds;
   uint16_t clockSyncInterval;
-  uint16_t wifiStatusTask;
+  long     wifiStatusTask;
 } waitingTimes = {
   60000,    // 60 seconds
   50000,    // 50 seconds
   9000,     // 09 seconds
-  1800 ,    // 30 minutes
-  660,      // 11 minutes
-  300,      // 05 minutes
-  320,      // 05 minutes 20 seconds
-  680,      // 11 minutes 20 seconds
+  1800000,  // 30 minutes
+  660000,   // 11 minutes
+  300000,   // 05 minutes
+  320000,   // 05 minutes 20 seconds
+  680000,   // 11 minutes 20 seconds
   60,       // 60 seconds
   15,       // 15 seconds
   60000,    // 60 seconds
   86400,    // 01 day
   180,      // 03 minutes
-  5,        // 05 seconds
+  5000,     // 05 seconds
 };
 
 struct {
@@ -228,7 +228,7 @@ struct {
   bool hasWaterValueChanged;
   uint16_t lowerLimit;
   uint16_t upperLimit;
-} waterLevelValues = {0, true, 250, 900};
+} waterLevelValues = {0, true, 435, 900};
 
 struct {
   String formattedTime;
@@ -284,8 +284,8 @@ struct {
 #endif
 
 // ArduinoJson constants
-const size_t TIMEZONE_DB_BUFFER_SIZE = JSON_OBJECT_SIZE(13) + 226;
-const size_t EXTREME_IP_BUFFER_SIZE = JSON_OBJECT_SIZE(15) + 286;
+const size_t TIMEZONE_DB_BUFFER_SIZE = JSON_OBJECT_SIZE(13) + 396;
+const size_t EXTREME_IP_BUFFER_SIZE = JSON_OBJECT_SIZE(15) + 530;
 
 // Other global variables
 bool setupExecuted = false;
@@ -328,7 +328,6 @@ String formatDigits(int value);
 time_t syncTimeFromNTP(void);
 void updateDHTInfo(void);
 void updateWaterLevelInfo(void);
-bool areTimesDifferent(String time1, String time2);
 uint8_t toWiFiQuality(int32_t rssi);
 void setupLatitudeLongitude(void);
 void getTimezoneOffset(void);
@@ -400,7 +399,7 @@ void setup(void) {
     Serial.print(F("HTTP server:")); Serial.println(WiFi.localIP().toString());
 #endif
 #if SYSLOG
-    syslog.log(LOG_INFO, "WiFi connected! Starting remote logging");
+    syslog.log(LOG_WARNING, "WiFi connected! Starting remote logging");
 #endif
     lcd.clear();
     lcd.home();
@@ -459,15 +458,15 @@ void setup(void) {
   dhtId = timers.dhtSensor.setInterval(waitingTimes.tempHumdSensor, updateDHTInfo);
   waterSensorTimerId = timers.wlvlOnTimer.setInterval(waitingTimes.waterLevelOnTimer, turnOnWaterLevelSensor);
   waterLevelTimerId = timers.waterSensor.setInterval(waitingTimes.waterLevelSensor, updateWaterLevelInfo);
-  timers.offsetControl.setInterval(waitingTimes.offsetSeconds * 1000, setupClock);
-  timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds * 1000, publishWiFiStrength);
-  timers.tempTask.setInterval(waitingTimes.tempTaskSeconds * 1000, publishTemperature);
-  timers.humdTask.setInterval(waitingTimes.humdTaskSeconds * 1000, publishHumidity);
-  timers.wlvlTask.setInterval(waitingTimes.wlvlTaskSeconds * 1000, publishWaterLevel);
+  timers.offsetControl.setInterval(waitingTimes.offsetSeconds, setupClock);
+  timers.wifiTask.setInterval(waitingTimes.wifiTaskSeconds, publishWiFiStrength);
+  timers.tempTask.setInterval(waitingTimes.tempTaskSeconds, publishTemperature);
+  timers.humdTask.setInterval(waitingTimes.humdTaskSeconds, publishHumidity);
+  timers.wlvlTask.setInterval(waitingTimes.wlvlTaskSeconds, publishWaterLevel);
+  timers.wifiStatusTask.setInterval(waitingTimes.wifiStatusTask, handleWifiStatus);
   timers.updateStatistics.attach(waitingTimes.statisticsTaskSeconds, statisticsUpdate);
   timers.displayTask.attach(waitingTimes.displayTaskSeconds, changeDisplayMode);
   timers.clearStatsTask.attach(waitingTimes.clearStatsSeconds, clearStats);
-  timers.wifiStatusTask.setInterval(waitingTimes.wifiStatusTask * 1000, handleWifiStatus);
 
   updateDHTInfo();
   updateWaterLevelInfo();
@@ -481,7 +480,8 @@ void setup(void) {
   Serial.println(setupFinishedTime);
 #endif
 #if SYSLOG
-  syslog.logf(LOG_INFO, "Finished setup. Elapsed time: %d", millis());
+  syslog.logf(LOG_WARNING, "Finished setup. Elapsed time: %d", millis());
+  syslog.logf(LOG_WARNING, "Running version: %s", ESP.getSketchMD5().c_str());
 #endif
 }
 
@@ -555,7 +555,7 @@ void initEEPROM(void) {
     EEPROM.get(options.displayTaskSecsAddress, waitingTimes.displayTaskSeconds);
     EEPROM.get(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
     EEPROM.get(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
-    waitingTimes.waterLevelOnTimer = waitingTimes.waterLevelSensor - 1000;
+    waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor - 1000L);
   }
 }
 
@@ -621,18 +621,12 @@ void powerOnSensor(uint8_t ePin) {
 #if DEVMODE
   Serial.printf("Turning on sensor at pin: %i\n", ePin);
 #endif
-#if SYSLOG
-  syslog.logf(LOG_DEBUG, "Turning on sensor at pin: %i", ePin);
-#endif
   digitalWrite(ePin, HIGH);
 }
 
 void powerOffSensor(uint8_t ePin) {
 #if DEVMODE
   Serial.printf("Turning off sensor at pin: %i\n", ePin);
-#endif
-#if SYSLOG
-  syslog.logf(LOG_DEBUG, "Turning off sensor at pin: %i", ePin);
 #endif
   digitalWrite(ePin, LOW);
 }
@@ -838,12 +832,12 @@ void handleGPIO(void) {
     }
   }
   if (server.arg("wlvl") != "") {
-    long waterLevelTime = (atol(server.arg("wlvl").c_str()) * 1000);
-    if ((waterLevelTime != waitingTimes.waterLevelSensor) && (waterLevelTime >= 2000)) {
+    long waterLevelTime = (atol(server.arg("wlvl").c_str()) * 1000L);
+    if ((waterLevelTime != waitingTimes.waterLevelSensor) && (waterLevelTime >= 2000L)) {
       waitingTimes.waterLevelSensor = waterLevelTime;
       EEPROM.put(options.waterLevelTimeAddress, waitingTimes.waterLevelSensor);
       hasAnyValueChanged = true;
-      waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor - 1000);
+      waitingTimes.waterLevelOnTimer = (waitingTimes.waterLevelSensor - 1000L);
       timers.waterSensor.deleteTimer(waterLevelTimerId);
       timers.wlvlOnTimer.deleteTimer(waterSensorTimerId);
       waterSensorTimerId = timers.wlvlOnTimer.setInterval(waitingTimes.waterLevelOnTimer, turnOnWaterLevelSensor);
@@ -851,8 +845,8 @@ void handleGPIO(void) {
     }
   }
   if (server.arg("dht") != "") {
-    int tempHumdTime = (atol(server.arg("dht").c_str()) * 1000);
-    if ((tempHumdTime != waitingTimes.tempHumdSensor) && (tempHumdTime >= 3000)) {
+    long tempHumdTime = (atol(server.arg("dht").c_str()) * 1000L);
+    if ((tempHumdTime != waitingTimes.tempHumdSensor) && (tempHumdTime >= 3000L)) {
       waitingTimes.tempHumdSensor = tempHumdTime;
       EEPROM.put(options.tempHumdTimeAddress, waitingTimes.tempHumdSensor);
       hasAnyValueChanged = true;
@@ -928,9 +922,6 @@ void changeDisplayMode(void) {
   displayModeChanged = true;
 #if DEVMODE
   Serial.printf("Changing display mode: %d\n", displayMode);
-#endif
-#if SYSLOG
-  syslog.logf(LOG_INFO, "Changing display mode: %d\n", displayMode);
 #endif
 }
 
@@ -1009,14 +1000,16 @@ void updateDHTInfo(void) {
     Serial.println(F("°C"));
     Serial.printf("No fixed temp: %.2f\n", event.temperature);
 #endif
-#if SYSLOG
-    syslog.logf(LOG_DEBUG, "Temperature: %.2f ºC", event.temperature + options.temperatureFix);
-#endif
     if (event.temperature != dhtValues.latestTemperature) {
       dhtValues.latestTemperature = (event.temperature + options.temperatureFix);
       dhtValues.hasTempChanged = true;
     }
+  } 
+#if SYSLOG
+  else {
+    syslog.logf(LOG_ERR, "Error reading temperature after %d attemps", tempAttemps);
   }
+#endif
   // Get humidity event and print its value.
   dht.humidity().getEvent(&event);
   uint8_t humdAttemps = 0;
@@ -1039,14 +1032,16 @@ void updateDHTInfo(void) {
     Serial.print(event.relative_humidity);
     Serial.println(F("%"));
 #endif
-#if SYSLOG
-    syslog.logf(LOG_DEBUG, "Humidity: %i%", event.relative_humidity);
-#endif
     if (event.relative_humidity != dhtValues.latestHumidity) {
       dhtValues.latestHumidity = event.relative_humidity;
       dhtValues.hasHumdChanged = true;
     }
   }
+#if SYSLOG
+  else {
+    syslog.logf(LOG_ERR, "Error reading humidity after %d attemps", humdAttemps);
+  }
+#endif
 }
 
 void updateWaterLevelInfo(void) {
@@ -1059,10 +1054,6 @@ void updateWaterLevelInfo(void) {
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
   uint8_t percentageWaterValue = map(currentWaterValue, waterLevelValues.upperLimit,
                                      waterLevelValues.lowerLimit, 0, 100);
-#if SYSLOG
-  syslog.logf(LOG_DEBUG, "Water value (analog): %i | Percentage: %i%", currentWaterValue, 
-                                                                       percentageWaterValue);
-#endif
 #if DEVMODE
   Serial.printf("Water value (analog): %i | Percentage: %i%\n", currentWaterValue, 
                                                                 percentageWaterValue);
@@ -1074,22 +1065,6 @@ void updateWaterLevelInfo(void) {
     waterLevelValues.hasWaterValueChanged = true;
   }
   powerOffSensor(MOISTURE_ENABLE_PIN);
-}
-
-bool areTimesDifferent(String time1, String time2) {
-#if VVV
-  Serial.println(time1.substring(0, 2) + " | " + time2.substring(0, 2));
-  Serial.println(time1.substring(3, 5) + " | " + time2.substring(3, 5));
-  Serial.println(time1.substring(6, 8) + " | " + time2.substring(6, 8));
-#endif
-  if (time1.substring(0, 2) != time2.substring(0, 2))
-    return true;
-  else if (time1.substring(3, 5) != time2.substring(3, 5))
-    return true;
-  else if (time1.substring(6, 8) != time2.substring(6, 8))
-    return true;
-  else
-    return false;
 }
 
 uint8_t toWiFiQuality(int32_t rssi) {
@@ -1116,7 +1091,8 @@ void setupLatitudeLongitude(void) {
       http.begin(client, EXTREME_IP_URL);
       int httpCode = http.GET();
       if (httpCode > 0) {
-        DynamicJsonDocument jsonBuffer(EXTREME_IP_BUFFER_SIZE);
+//        DynamicJsonDocument jsonBuffer(EXTREME_IP_BUFFER_SIZE);
+        StaticJsonDocument<EXTREME_IP_BUFFER_SIZE> jsonBuffer;
         DeserializationError error = deserializeJson(jsonBuffer, http.getString());
         if (error == DeserializationError::Ok) {
 #if DEVMODE
@@ -1130,6 +1106,9 @@ void setupLatitudeLongitude(void) {
           Serial.print(F("\"IP-API\" deserializeJson() failed with code "));
           Serial.println(error.c_str());
 #endif
+#if SYSLOG
+          syslog.logf(LOG_ERR, "IP-API deserialization failed with code %s", error.c_str());
+#endif
         }
         jsonBuffer.clear();
       }
@@ -1137,9 +1116,13 @@ void setupLatitudeLongitude(void) {
 #if DEVMODE
         Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
 #endif
+#if SYSLOG
+        syslog.logf(LOG_ERR, "[HTTP] GET (IP Lookup)... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
+#endif
       }
       http.end();
-      geolocationInformation.connectedSSID = WiFi.SSID();
+      if (httpCode > 0)
+        geolocationInformation.connectedSSID = WiFi.SSID();
     }
   }
 }
@@ -1156,7 +1139,8 @@ void getTimezoneOffset(void) {
     http.begin(client, formattedUrl);
     int httpCode = http.GET();
     if (httpCode > 0) {
-      DynamicJsonDocument jsonBuffer(TIMEZONE_DB_BUFFER_SIZE);
+//      DynamicJsonDocument jsonBuffer(TIMEZONE_DB_BUFFER_SIZE);
+      StaticJsonDocument<TIMEZONE_DB_BUFFER_SIZE> jsonBuffer;
       DeserializationError error = deserializeJson(jsonBuffer, http.getString());
       if (error == DeserializationError::Ok) {
 #if DEVMODE
@@ -1168,11 +1152,17 @@ void getTimezoneOffset(void) {
         Serial.print("\"timezone\" deserializeJson() failed with code ");
         Serial.println(error.c_str());
 #endif
+#if SYSLOG
+        syslog.logf(LOG_ERR, "IP-API deserialization failed with code %s", error.c_str());
+#endif
       }
       jsonBuffer.clear();
     } else {
 #if DEVMODE
       Serial.printf("[HTTPS] GET... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
+#endif
+#if SYSLOG
+      syslog.logf(LOG_ERR, "[HTTP] GET (TimeZone DB)... failed, error: %s\n\r", http.errorToString(httpCode).c_str());
 #endif
     }
     delete[] formattedUrl;
@@ -1289,9 +1279,6 @@ void lookForOTAUpdates(void) {
 #if DEVMODE
     Serial.println(F("Looking for OTAs..."));
 #endif
-#if SYSLOG
-    syslog.log(LOG_INFO, "Looking for OTAs...");
-#endif
     ESPhttpUpdate.setLedPin(LED_PIN, HIGH);
     t_httpUpdate_return returnValue = ESPhttpUpdate.update(client, OTA_URL, RUNNING_VERSION);
 
@@ -1299,6 +1286,9 @@ void lookForOTAUpdates(void) {
       case HTTP_UPDATE_FAILED:
 #if DEVMODE
         Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+#endif
+#if SYSLOG
+        syslog.logf(LOG_ERR, "HTTP_UPDATE_FAILD Error (%d): %s", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
 #endif
         break;
       case HTTP_UPDATE_NO_UPDATES:
@@ -1313,6 +1303,9 @@ void lookForOTAUpdates(void) {
         lcd.print(F("Updating..."));
 #if DEVMODE
         Serial.println("[update] Update ok."); // may not called we reboot the ESP
+#endif
+#if SYSLOG
+        syslog.log(LOG_WARNING, F("[update] Update OK"));
 #endif
         break;
     }
