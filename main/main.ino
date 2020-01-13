@@ -7,6 +7,8 @@
 
 // Web control & WiFi libraries
 #include <Arduino.h>
+#include <wiring_private.h>
+#include <pins_arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WiFiMulti.h>
@@ -180,7 +182,6 @@ struct {
   long     otaCheckMs;
   uint32_t clearStatsSeconds;
   uint16_t clockSyncInterval;
-  long     wifiStatusTask;
 } waitingTimes = {
   60000,    // 60 seconds
   50000,    // 50 seconds
@@ -194,8 +195,7 @@ struct {
   15,       // 15 seconds
   60000,    // 60 seconds
   86400,    // 01 day
-  180,      // 03 minutes
-  5000,     // 05 seconds
+  180       // 03 minutes
 };
 
 struct {
@@ -205,7 +205,6 @@ struct {
   Ticker updateStatistics;
   Ticker displayTask;
   Ticker clearStatsTask;
-  SimpleTimer wifiStatusTask;
   SimpleTimer offsetControl;
   SimpleTimer wifiTask;
   SimpleTimer tempTask;
@@ -299,6 +298,7 @@ unsigned long wifiExecutionTime = 0L;
 int dhtId;
 int waterSensorTimerId;
 int waterLevelTimerId;
+bool moistureSensorOn = false;
 
 // Define the functions that will be
 // available
@@ -310,6 +310,7 @@ void substituteBonsaiChar(void);
 void powerOnSensor(uint8_t ePin);
 void powerOffSensor(uint8_t ePin);
 void turnOnWaterLevelSensor(void);
+void turnOffWaterLevelSensor(void);
 void lcdPrintTime(void);
 void lcdPrintDHT(void);
 void lcdPrintWaterLevel(void);
@@ -338,7 +339,6 @@ void publishHumidity(void);
 void publishWaterLevel(void);
 void statisticsUpdate(void);
 void clearStats(void);
-void handleWifiStatus(void);
 #if OTA_ENABLED
 void lookForOTAUpdates(void);
 #endif
@@ -463,7 +463,6 @@ void setup(void) {
   timers.tempTask.setInterval(waitingTimes.tempTaskSeconds, publishTemperature);
   timers.humdTask.setInterval(waitingTimes.humdTaskSeconds, publishHumidity);
   timers.wlvlTask.setInterval(waitingTimes.wlvlTaskSeconds, publishWaterLevel);
-  timers.wifiStatusTask.setInterval(waitingTimes.wifiStatusTask, handleWifiStatus);
   timers.updateStatistics.attach(waitingTimes.statisticsTaskSeconds, statisticsUpdate);
   timers.displayTask.attach(waitingTimes.displayTaskSeconds, changeDisplayMode);
   timers.clearStatsTask.attach(waitingTimes.clearStatsSeconds, clearStats);
@@ -486,15 +485,10 @@ void setup(void) {
 }
 
 void loop(void) {
-  timers.wifiStatusTask.run();
-  timers.offsetControl.run();
   updateTime();
   timers.wlvlOnTimer.run();
   timers.waterSensor.run();
   timers.dhtSensor.run();
-#if OTA_ENABLED
-  timers.ota.run();
-#endif
   Portal.handleClient();
   switch ((uint8_t) displayMode) {
     case DEFAULT_MODE:
@@ -528,10 +522,14 @@ void loop(void) {
       displayMode = DEFAULT_MODE;
       break;
   }
+  timers.offsetControl.run();
   timers.wifiTask.run();
   timers.tempTask.run();
   timers.humdTask.run();
   timers.wlvlTask.run();
+#if OTA_ENABLED
+  timers.ota.run();
+#endif
 }
 
 
@@ -622,6 +620,7 @@ void powerOnSensor(uint8_t ePin) {
   Serial.printf("Turning on sensor at pin: %i\n", ePin);
 #endif
   digitalWrite(ePin, HIGH);
+
 }
 
 void powerOffSensor(uint8_t ePin) {
@@ -632,7 +631,17 @@ void powerOffSensor(uint8_t ePin) {
 }
 
 void turnOnWaterLevelSensor(void) {
-  powerOnSensor(MOISTURE_ENABLE_PIN);
+  if (!moistureSensorOn) {
+    powerOnSensor(MOISTURE_ENABLE_PIN);
+    moistureSensorOn = true;
+  }
+}
+
+void turnOffWaterLevelSensor(void) {
+  if (moistureSensorOn) {
+    powerOffSensor(MOISTURE_ENABLE_PIN);
+    moistureSensorOn = false;
+  }
 }
 
 void lcdPrintTime(void) {
@@ -1054,6 +1063,7 @@ void updateWaterLevelInfo(void) {
   uint16_t currentWaterValue = analogRead(WATER_LEVEL_DATA_PIN);
   uint8_t percentageWaterValue = map(currentWaterValue, waterLevelValues.upperLimit,
                                      waterLevelValues.lowerLimit, 0, 100);
+  turnOffWaterLevelSensor();
 #if DEVMODE
   Serial.printf("Water value (analog): %i | Percentage: %i%\n", currentWaterValue, 
                                                                 percentageWaterValue);
@@ -1064,7 +1074,6 @@ void updateWaterLevelInfo(void) {
     waterLevelValues.waterValue = percentageWaterValue;
     waterLevelValues.hasWaterValueChanged = true;
   }
-  powerOffSensor(MOISTURE_ENABLE_PIN);
 }
 
 uint8_t toWiFiQuality(int32_t rssi) {
@@ -1258,19 +1267,6 @@ void statisticsUpdate(void) {
 void clearStats(void) {
   tempStats.reset();
   humdStats.reset();
-}
-
-void handleWifiStatus(void) {
-  if (WiFi.status() != WL_CONNECTED) {
-    uint8_t configs = credentials.entries();
-    struct station_config savedConfig;
-    for (int i = 0; i < configs; ++i) {
-      credentials.load(i, &savedConfig);
-      wifiMulti.addAP((const char *) savedConfig.ssid, (const char *) savedConfig.password);
-    }
-    wifiMulti.run();
-  }
-  return;
 }
 
 #if OTA_ENABLED
